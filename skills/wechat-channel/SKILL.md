@@ -1,6 +1,6 @@
 ---
 name: 微信渠道
-description: 安装/登录/收发/卸载微信 iLink。每号一专属助手；全局 webhook 唤醒安装助手后转交专属助手（也可选每号 webhook 直达）；历史首次完整同步、之后由其持久会话自带；收信自动正在输入（持续保活至回复）；回复后 ack。
+description: 用户要在 Grok Bot 里安装、登录、收发、登出或卸载微信 iLink 渠道时使用（例如「安装这个微信插件 https://github.com/little-thing/grok-wechat-plugin」）。入站用 webhook 唤醒；每号一专属助手；历史首次完整同步、之后由其持久会话自带；收信自动正在输入；回复后 ack。支持文字、语音转写、图片/视频/文件。
 ---
 # 微信渠道
 
@@ -12,14 +12,15 @@ MCP `grok-wechat` → iLink。
 
 ## 安装（一次）
 
-用户：「安装这个微信插件 https://github.com/little-thing/grok-wechat-plugin」
+用户发一句「安装这个微信插件 https://github.com/little-thing/grok-wechat-plugin」即开始安装，按下面步骤**自动一路做完**，只在需要用户动手时停下（点「加」、粘贴 webhook 的 url+key、扫码）。技能就是本文件。
 
-1. 加连接器 `grok-wechat`（`server/index.js`）
+1. 加连接器 `grok-wechat`（`server/index.js`；用户若需确认则点「加」）。monitor 在连接器启动时自动拉起
 2. Routine「微信入站唤醒」(webhook，全局一条)：prompt 用下面「分发 Routine 的 prompt」原文，**不要加别的**
 3. Routine「微信监听保活」每 **20 分钟**：只调 `wechat_start_monitor`
-4. 用户粘贴 webhook url+key → `wechat_set_wake`（不带 `ilink_bot_id` = 全局）
-5. `wechat_login_start` → 立刻 `wechat_login_wait` 至 `logged_in`
-6. 每号：建专属助手 → `wechat_set_dedicated_assistant`
+4. 平台创建 webhook Routine 后**不会**把 url/key 返回给 agent：请用户从该 Routine 面板复制地址和密钥发来一次 → `wechat_set_wake`（不带 `ilink_bot_id` = 全局，之后所有账号共用，不用再贴）
+5. `wechat_login_start`（把二维码展示给用户）→ 立刻 `wechat_login_wait`，重复调用至 `logged_in=true`；`expired=true` 则重新 `wechat_login_start` 再等。对方先发一条消息才有 context_token
+6. 每号：建专属助手 → `wechat_set_dedicated_assistant(ilink_bot_id, assistant_id, assistant_name)`（专属助手不建入站 Routine）。更多账号重复第 5、6 步
+7. **自检**：`wechat_status` 每号应显示 `wake: "global"` 与专属助手名；然后让用户从微信发一条消息，确认收到回复
 
 ### 分发 Routine 的 prompt（最简，原文使用）
 
