@@ -201,6 +201,51 @@ export function getTalkHistory(ilink_bot_id, from_user_id, upTo) {
   return list.map((e) => ({ r: e.role === "assistant" ? "a" : "u", t: e.text || "" }));
 }
 
+const clampInt = (v, lo, hi, dflt) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.trunc(n))) : dflt;
+};
+
+/**
+ * Verbatim, pageable, searchable access to the FULL talk log. Turns are never
+ * truncated or summarized; `limit` only sets the page size, and `before` pages back
+ * through everything. `i` is the absolute turn index (same as the position in the
+ * wake payload's `hist[sid]`).
+ *
+ *  - no query: the `limit` turns just before `before` (default: the end)
+ *  - query:    the `limit` most recent turns containing `query` (case-insensitive),
+ *              each with `context` turns of surrounding conversation
+ */
+export function queryTalk(ilink_bot_id, from_user_id, { before, limit, query, context } = {}) {
+  const key = talkKey(ilink_bot_id, from_user_id);
+  const file = talkFile(key);
+  migrateLegacyTalk(key, file);
+  const all = readTalkEntries(file).map((e, i) => ({ i, r: e.role === "assistant" ? "a" : "u", t: e.text || "" }));
+  const total = all.length;
+  const lim = clampInt(limit, 1, 500, 40);
+  const end = before == null || before === "" ? total : clampInt(before, 0, total, total);
+  const pool = all.slice(0, end);
+
+  const q = query == null ? "" : String(query).trim().toLowerCase();
+  if (q) {
+    const hits = pool.filter((e) => e.t.toLowerCase().includes(q)).map((e) => e.i);
+    const recent = hits.slice(-lim);
+    const ctx = clampInt(context, 0, 10, 0);
+    const want = new Set();
+    for (const i of recent) {
+      for (let k = Math.max(0, i - ctx); k <= Math.min(end - 1, i + ctx); k++) want.add(k);
+    }
+    return {
+      total,
+      matches: hits.length,
+      turns: [...want].sort((a, b) => a - b).map((i) => all[i]),
+      more: hits.length > recent.length,
+    };
+  }
+  const turns = pool.slice(-lim);
+  return { total, turns, more: turns.length > 0 && turns[0].i > 0 };
+}
+
 export function getTalkCount(ilink_bot_id, from_user_id) {
   const key = talkKey(ilink_bot_id, from_user_id);
   const file = talkFile(key);

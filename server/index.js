@@ -19,7 +19,9 @@ import {
   packMsgs,
   paths,
   peekInbox,
+  queryTalk,
   removeAccount,
+  resolveAccountForPeer,
   resolveWakeForAccount,
   slim,
   talkKey,
@@ -183,6 +185,34 @@ const tools = {
     },
     handle: async ({ ids }) => ok(ackInbox(ids)),
   },
+  wechat_history: {
+    description: "Read the FULL verbatim talk history (never summarized). Target: sid, or bot+from (from alone works if unambiguous). No query: last `limit` turns before `before`; page back with before=<first turn i>. query: most recent matching turns (+`context` turns around each). Turn i = index in wake hist[sid].",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sid: { type: "string", description: "session id from msgs[].sid" },
+        bot: { type: "string" },
+        from: { type: "string" },
+        before: { type: "number", description: "exclusive turn index to page back from (default: end)" },
+        limit: { type: "number", description: "page size, default 40, max 500" },
+        query: { type: "string", description: "case-insensitive substring search" },
+        context: { type: "number", description: "turns of context around each match, 0-10" },
+      },
+    },
+    handle: async ({ sid, bot, from, before, limit, query, context }) => {
+      let botId = bot;
+      let peer = from;
+      if (sid) {
+        const cut = String(sid).indexOf("::");
+        if (cut < 0) throw new Error("sid 格式应为 <bot>::<from>");
+        botId = String(sid).slice(0, cut);
+        peer = String(sid).slice(cut + 2);
+      }
+      if (!peer) throw new Error("需要 sid，或 bot+from");
+      if (!botId) botId = resolveAccountForPeer(loadState(), { to_user_id: peer }).ilinkBotId;
+      return ok({ sid: talkKey(botId, peer), ...queryTalk(botId, peer, { before, limit, query, context }) });
+    },
+  },
   wechat_send: {
     description: "Send text; needs prior inbound context_token. Markdown→plain.",
     inputSchema: {
@@ -327,7 +357,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.4.0" },
+        serverInfo: { name: "grok-wechat", version: "1.5.0" },
       },
     };
   }

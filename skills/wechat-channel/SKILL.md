@@ -31,6 +31,7 @@ MCP `grok-wechat` → iLink。
 ```
 
 - `hist[sid]` = 该批消息**之前**的全部轮次（连续重复的助手回复已合并）；当前消息在 `msgs`
+- 需要更早/具体的内容（如「上次说的快递单号」）：调 `wechat_history`（`sid` + `query` 搜索，或 `before=<首条 i>` 向前翻页），返回**原文、不摘要**；`hist[sid]` 第 k 项即第 `i=k` 轮。无需时不要调用
 - 连发的多条消息合并为一次唤醒，按 `msgs` 顺序一起处理、一次回复即可
 - `media[].path` 是本机文件路径
 
@@ -42,7 +43,7 @@ MCP `grok-wechat` → iLink。
 
 ## 工具
 
-`login_start/wait` · `set_wake` · `set_dedicated_assistant` · `status` · `inbox` · `ack` · `send` · `send_media` · `typing` · `start/stop_monitor` · `approve` · `logout` · `uninstall`
+`login_start/wait` · `set_wake` · `set_dedicated_assistant` · `status` · `inbox` · `ack` · `history` · `send` · `send_media` · `typing` · `start/stop_monitor` · `approve` · `logout` · `uninstall`
 
 ## 卸载
 
