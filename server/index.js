@@ -3,19 +3,20 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
+  ackInbox,
   appendInbox,
   appendTalk,
   clearPid,
-  drainInbox,
   findAccount,
+  formatAgentMsg,
   getAccountAssistant,
   getTalkHistory,
-  HISTORY_RETURN_TURNS,
   isAllowed,
   listAccounts,
   loadState,
   monitorRunning,
   paths,
+  peekInbox,
   removeAccount,
   resolveWakeForAccount,
   slim,
@@ -163,9 +164,19 @@ const tools = {
     },
   },
   wechat_inbox: {
-    description: "Drain inbox. Fields: from,bot,text,media,sid,asst,hist(r/t). Route by bot→asst; use hist.",
+    description: "Peek inbox (does NOT clear). Fields: id,from,bot,text,media,sid,asst,hist. Prefer wake.msgs if present. After reply call wechat_ack.",
     inputSchema: { type: "object", properties: {} },
-    handle: async () => ok({ msgs: drainInbox() }),
+    handle: async () => ok({ msgs: peekInbox(), ack: "wechat_ack" }),
+  },
+  wechat_ack: {
+    description: "Ack/remove inbox msgs after successful reply. Pass ids from msgs; omit ids to clear all.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ids: { type: "array", items: { type: "string" }, description: "msg ids to remove" },
+      },
+    },
+    handle: async ({ ids }) => ok(ackInbox(ids)),
   },
   wechat_send: {
     description: "Send text; needs prior inbound context_token. Markdown→plain.",
@@ -315,7 +326,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.2.0" },
+        serverInfo: { name: "grok-wechat", version: "1.3.0" },
       },
     };
   }
@@ -407,8 +418,8 @@ function stampSessionContext(messages) {
     m.session_id = m.session_id || talkKey(m.ilink_bot_id, m.from_user_id);
     m.dedicated_assistant_id = dedicated?.id || m.dedicated_assistant_id || "";
     m.dedicated_assistant_name = dedicated?.name || m.dedicated_assistant_name || "";
-    // Prior turns only — current inbound is recorded after this stamp.
-    m.history = getTalkHistory(m.ilink_bot_id, m.from_user_id, HISTORY_RETURN_TURNS);
+    // Prior turns only — current inbound is recorded after this stamp. Full history, no cap.
+    m.history = getTalkHistory(m.ilink_bot_id, m.from_user_id);
   }
 }
 
@@ -423,6 +434,9 @@ function recordInboundTalks(messages) {
     });
   }
 }
+
+const COALESCE_MS = 700;
+const WAKE_TIMEOUT_MS = 12_000;
 
 async function wakeAgent(messages, log) {
   if (!messages.length) return;
@@ -441,9 +455,10 @@ async function wakeAgent(messages, log) {
       return;
     }
     const dedicated = getAccountAssistant(state, botId);
+    const msgs = batch.map((m) => formatAgentMsg(m, state));
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8_000);
+      const timer = setTimeout(() => controller.abort(), WAKE_TIMEOUT_MS);
       let res;
       try {
         res = await fetch(cfg.url, {
@@ -452,12 +467,15 @@ async function wakeAgent(messages, log) {
             Authorization: `Bearer ${cfg.key}`,
             "Content-Type": "application/json",
           },
-          // Minimal wake body — agent pulls detail via wechat_inbox.
+          // Full payload so the agent can skip wechat_inbox on the happy path.
           body: JSON.stringify({
             src: "grok-wechat",
-            n: batch.length,
+            n: msgs.length,
             bot: botId,
             asst: dedicated?.name || account?.dedicatedAssistant?.name || "",
+            asst_id: dedicated?.id || account?.dedicatedAssistant?.id || "",
+            msgs,
+            ack: "wechat_ack",
           }),
           signal: controller.signal,
         });
@@ -465,7 +483,7 @@ async function wakeAgent(messages, log) {
         clearTimeout(timer);
       }
       const text = await res.text();
-      log(`wake bot=${botId} ${res.status} ${text.slice(0, 120)}`);
+      log(`wake bot=${botId} n=${msgs.length} ${res.status} ${text.slice(0, 120)}`);
     } catch (err) {
       log(`wake error bot=${botId} ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -514,22 +532,31 @@ async function runMonitor() {
         clearPid();
         process.exit(0);
       }
-      const results = await Promise.all(accountsNow.map((account) => pollAccount(account, log)));
+      let results = await Promise.all(accountsNow.map((account) => pollAccount(account, log)));
       failures = 0;
-      const batch = results.flatMap((r) => r.messages);
+      let batch = results.flatMap((r) => r.messages);
       if (results.some((r) => r.expired)) {
         await sleep(60_000);
       }
       if (batch.length) {
+        // Show typing ASAP on first sight; coalesce follow-ups into one cold start.
+        void startTypingForInbound(batch, log);
+        await sleep(COALESCE_MS);
+        const more = await Promise.all(listAccounts().map((account) => pollAccount(account, log)));
+        const extra = more.flatMap((r) => r.messages);
+        if (extra.length) {
+          batch = batch.concat(extra);
+          void startTypingForInbound(extra, log);
+        }
         stampSessionContext(batch);
         recordInboundTalks(batch);
-        appendInbox(batch);
-        log(`inbox +${batch.length}`);
-        // Wake agent immediately; typing in parallel (must not delay wake).
-        await Promise.all([
-          wakeAgent(batch, log),
-          startTypingForInbound(batch, log),
-        ]);
+        const stored = appendInbox(batch);
+        for (let i = 0; i < batch.length; i++) {
+          if (stored[i]?.id) batch[i].id = stored[i].id;
+        }
+        log(`inbox +${batch.length} (coalesced)`);
+        // Wake carries full msgs (text/media/hist) so agent can skip wechat_inbox.
+        await wakeAgent(batch, log);
       }
     } catch (err) {
       failures += 1;

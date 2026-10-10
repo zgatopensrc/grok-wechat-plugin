@@ -45,11 +45,6 @@ export function emptyState() {
   };
 }
 
-const MAX_TALK_TURNS = 24;
-const HISTORY_TEXT_MAX = 400;
-/** Agent-facing history turns (keeps MCP/tool tokens small). */
-export const HISTORY_RETURN_TURNS = 8;
-
 export function talkKey(ilinkBotId, fromUserId) {
   return `${ilinkBotId || ""}::${fromUserId || ""}`;
 }
@@ -83,14 +78,34 @@ function saveTalks(talks) {
   }
 }
 
-function clipText(text, max = HISTORY_TEXT_MAX) {
-  const s = String(text || "");
-  return s.length > max ? `${s.slice(0, max)}…` : s;
+function normTalkText(text) {
+  return String(text || "").replace(/\s+/g, " ").trim();
+}
+
+/** True when next turn is a duplicate/merge of prev (text+media double-log, etc.). */
+function isDuplicateTalk(prev, next) {
+  if (!prev || prev.role !== next.role) return false;
+  const a = normTalkText(prev.text);
+  const b = normTalkText(next.text);
+  if (!a && !b) return true;
+  if (a === b) return true;
+  const stripMedia = (s) => {
+    const m = s.match(/^\[(image|video|file|voice)\]\s*(.*)$/i);
+    return m ? normTalkText(m[2]) : s;
+  };
+  const aCore = stripMedia(a);
+  const bCore = stripMedia(b);
+  // text then "[image] text", or reverse; same caption/body
+  if (aCore && bCore && (aCore === bCore || aCore.startsWith(bCore) || bCore.startsWith(aCore))) {
+    return true;
+  }
+  if (a && b && (a.startsWith(b) || b.startsWith(a))) return true;
+  return false;
 }
 
 /**
- * Append a turn to the per-account Grok-session talk log for a WeChat peer.
- * role: "user" | "assistant"
+ * Append a turn to the per-account talk log. History is not capped.
+ * Dedupes consecutive same-role duplicates (e.g. text + media of same reply).
  */
 export function appendTalk({ ilink_bot_id, from_user_id, role, text, at } = {}) {
   if (!from_user_id || !role) return [];
@@ -98,24 +113,34 @@ export function appendTalk({ ilink_bot_id, from_user_id, role, text, at } = {}) 
   const talks = loadTalks();
   const entry = {
     role,
-    text: clipText(text, 1200),
+    text: String(text || ""),
     at: at || Date.now(),
   };
   const list = Array.isArray(talks[key]) ? talks[key] : [];
+  const prev = list[list.length - 1];
+  if (isDuplicateTalk(prev, entry)) {
+    // Keep the richer text; bump timestamp.
+    if (normTalkText(entry.text).length > normTalkText(prev.text).length) {
+      prev.text = entry.text;
+    }
+    prev.at = entry.at;
+    talks[key] = list;
+    saveTalks(talks);
+    return list;
+  }
   list.push(entry);
-  talks[key] = list.slice(-MAX_TALK_TURNS);
+  talks[key] = list;
   saveTalks(talks);
-  return talks[key];
+  return list;
 }
 
-/** Compact `{r,t}` turns for agent context (token-cheap). */
-export function getTalkHistory(ilink_bot_id, from_user_id, limit = HISTORY_RETURN_TURNS) {
+/** Full history for a peer — no turn/text cap. Compact keys `{r,t}` only. */
+export function getTalkHistory(ilink_bot_id, from_user_id) {
   if (!from_user_id) return [];
   const list = loadTalks()[talkKey(ilink_bot_id, from_user_id)] || [];
-  const n = Math.max(1, Math.min(Number(limit) || HISTORY_RETURN_TURNS, MAX_TALK_TURNS));
-  return list.slice(-n).map((e) => ({
+  return list.map((e) => ({
     r: e.role === "assistant" ? "a" : "u",
-    t: clipText(e.text, HISTORY_TEXT_MAX),
+    t: e.text || "",
   }));
 }
 
@@ -295,21 +320,11 @@ export function isAllowed(state, userId) {
   return state.allowFrom.includes(userId);
 }
 
-export function appendInbox(messages) {
-  if (!messages.length) return;
-  ensureHome();
-  const { inbox } = paths();
-  const lines = messages.map((m) => JSON.stringify(m)).join("\n") + "\n";
-  fs.appendFileSync(inbox, lines);
-}
-
-export function drainInbox() {
+function readInboxRaw() {
   const { inbox } = paths();
   if (!fs.existsSync(inbox)) return [];
-  const raw = fs.readFileSync(inbox, "utf8");
-  fs.writeFileSync(inbox, "");
-  const state = loadState();
-  return raw
+  return fs
+    .readFileSync(inbox, "utf8")
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean)
@@ -320,24 +335,77 @@ export function drainInbox() {
         return null;
       }
     })
-    .filter(Boolean)
-    .map((msg) => {
-      const dedicated = getAccountAssistant(state, msg.ilink_bot_id);
-      // Omit context_token (server-side only) and empty noise to save agent tokens.
-      const media = (msg.items || []).filter((it) => it && it.type !== "text" && (it.path || it.text));
-      return slim({
-        from: msg.from_user_id,
-        bot: msg.ilink_bot_id,
-        text: msg.text || undefined,
-        media: media.length ? media.map((it) => slim({ type: it.type, path: it.path, name: it.name, text: it.text })) : undefined,
-        sid: msg.session_id || talkKey(msg.ilink_bot_id, msg.from_user_id),
-        asst: dedicated?.name || msg.dedicated_assistant_name || undefined,
-        asst_id: dedicated?.id || msg.dedicated_assistant_id || undefined,
-        hist: Array.isArray(msg.history)
-          ? msg.history
-          : getTalkHistory(msg.ilink_bot_id, msg.from_user_id),
-      });
-    });
+    .filter(Boolean);
+}
+
+function writeInboxRaw(messages) {
+  ensureHome();
+  const { inbox } = paths();
+  if (!messages.length) {
+    fs.writeFileSync(inbox, "");
+    return;
+  }
+  fs.writeFileSync(inbox, `${messages.map((m) => JSON.stringify(m)).join("\n")}\n`);
+}
+
+/** Agent-facing message shape (shared by inbox peek and wake webhook). */
+export function formatAgentMsg(msg, state = loadState()) {
+  const dedicated = getAccountAssistant(state, msg.ilink_bot_id);
+  const media = (msg.items || []).filter((it) => it && it.type !== "text" && (it.path || it.text));
+  return slim({
+    id: msg.id || undefined,
+    from: msg.from_user_id,
+    bot: msg.ilink_bot_id,
+    text: msg.text || undefined,
+    media: media.length
+      ? media.map((it) => slim({ type: it.type, path: it.path, name: it.name, text: it.text }))
+      : undefined,
+    sid: msg.session_id || talkKey(msg.ilink_bot_id, msg.from_user_id),
+    asst: dedicated?.name || msg.dedicated_assistant_name || undefined,
+    asst_id: dedicated?.id || msg.dedicated_assistant_id || undefined,
+    hist: Array.isArray(msg.history)
+      ? msg.history
+      : getTalkHistory(msg.ilink_bot_id, msg.from_user_id),
+  });
+}
+
+export function appendInbox(messages) {
+  if (!messages.length) return;
+  ensureHome();
+  const stamped = messages.map((m, i) => ({
+    ...m,
+    id: m.id || `m-${Date.now().toString(36)}-${i}-${Math.random().toString(36).slice(2, 8)}`,
+  }));
+  const { inbox } = paths();
+  const lines = stamped.map((m) => JSON.stringify(m)).join("\n") + "\n";
+  fs.appendFileSync(inbox, lines);
+  return stamped;
+}
+
+/** Peek inbox without clearing — ack after successful reply. */
+export function peekInbox() {
+  const state = loadState();
+  return readInboxRaw().map((msg) => formatAgentMsg(msg, state));
+}
+
+/** @deprecated use peekInbox + ackInbox */
+export function drainInbox() {
+  const msgs = peekInbox();
+  writeInboxRaw([]);
+  return msgs;
+}
+
+/** Remove messages by id after successful handling. Omitting ids clears all. */
+export function ackInbox(ids) {
+  const raw = readInboxRaw();
+  if (!ids?.length) {
+    writeInboxRaw([]);
+    return { acked: raw.length, remaining: 0 };
+  }
+  const drop = new Set(ids.map(String));
+  const kept = raw.filter((m) => !drop.has(String(m.id || "")));
+  writeInboxRaw(kept);
+  return { acked: raw.length - kept.length, remaining: kept.length };
 }
 
 export function peekInboxCount() {
