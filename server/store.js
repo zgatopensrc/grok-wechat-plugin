@@ -21,6 +21,9 @@ export function paths() {
     pid: path.join(home, "monitor.pid"),
     media: path.join(home, "media"),
     log: path.join(home, "monitor.log"),
+    seen: path.join(home, "seen.log"),
+    blocked: path.join(home, "blocked.json"),
+    debug: path.join(home, "mcp-host.log"),
   };
 }
 
@@ -384,10 +387,96 @@ export function resolveAccountForPeer(state, { to_user_id, ilink_bot_id } = {}) 
   return matches[0];
 }
 
+/**
+ * Default-deny. Allowed: anyone on the allowlist, plus the owner of each bound account
+ * (the WeChat user who scanned the QR). Everyone else must be approved first.
+ */
 export function isAllowed(state, userId) {
   if (!userId) return false;
-  if (!state.allowFrom?.length) return true;
-  return state.allowFrom.includes(userId);
+  if (state.allowFrom?.includes(userId)) return true;
+  return (state.accounts || []).some((a) => a.ilinkUserId && a.ilinkUserId === userId);
+}
+
+// --- blocked senders (so the owner can see who to approve) ----------------------
+function readBlocked() {
+  try {
+    return JSON.parse(fs.readFileSync(paths().blocked, "utf8")) || {};
+  } catch {
+    return {};
+  }
+}
+
+function writeBlocked(map) {
+  ensureHome();
+  const file = paths().blocked;
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify(map));
+  fs.renameSync(`${file}.tmp`, file);
+}
+
+export function noteBlocked(ilink_bot_id, from_user_id) {
+  const map = readBlocked();
+  const cur = map[from_user_id] || { n: 0 };
+  map[from_user_id] = { bot: ilink_bot_id, n: cur.n + 1, at: Date.now() };
+  const keep = Object.entries(map).sort((a, b) => b[1].at - a[1].at).slice(0, 20); // newest 20 senders
+  writeBlocked(Object.fromEntries(keep));
+}
+
+export function listBlocked() {
+  return Object.entries(readBlocked())
+    .map(([from, v]) => ({ from, bot: v.bot, n: v.n, at: v.at }))
+    .sort((a, b) => b.at - a.at);
+}
+
+export function clearBlocked(from_user_id) {
+  const map = readBlocked();
+  if (from_user_id) delete map[from_user_id];
+  writeBlocked(from_user_id ? map : {});
+}
+
+// --- persisted inbound dedupe (iLink may redeliver after a cursor reset) --------
+export function loadSeenKeys(max) {
+  try {
+    return fs.readFileSync(paths().seen, "utf8").split("\n").filter(Boolean).slice(-max);
+  } catch {
+    return [];
+  }
+}
+
+export function appendSeenKeys(keys, max) {
+  if (!keys.length) return;
+  ensureHome();
+  const file = paths().seen;
+  fs.appendFileSync(file, `${keys.join("\n")}\n`);
+  try {
+    const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+    if (lines.length > max * 2) fs.writeFileSync(file, `${lines.slice(-max).join("\n")}\n`);
+  } catch {
+    // ignore
+  }
+}
+
+/** Dedicated assistant stopped replying: remember it, clear the registration. */
+export function markAssistantLost(ilink_bot_id) {
+  let lost = null;
+  updateState((s) => {
+    const a = findAccount(s, { ilink_bot_id });
+    if (a?.dedicatedAssistant) {
+      lost = { ...a.dedicatedAssistant, at: Date.now() };
+      a.lostAssistant = lost;
+      a.dedicatedAssistant = null;
+    }
+    return s;
+  });
+  if (lost) {
+    saveStateSecure(loadState());
+    resetSeeded(ilink_bot_id);
+  }
+  return lost;
+}
+
+/** Raw inbox rows (monitor recovery after a restart). */
+export function listInboxRaw() {
+  return readInboxRaw();
 }
 
 function sleepSync(ms) {
@@ -463,7 +552,7 @@ export function formatAgentMsg(msg, state = loadState()) {
       ? media.map((it) => slim({ type: it.type, path: it.path, name: it.name, text: it.text }))
       : undefined,
     sid: msg.session_id || talkKey(msg.ilink_bot_id, msg.from_user_id),
-    asst: dedicated?.name || msg.dedicated_assistant_name || undefined,
+    asst: dedicated?.name || undefined,
   });
 }
 

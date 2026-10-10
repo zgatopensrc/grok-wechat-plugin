@@ -33,11 +33,21 @@ MCP `grok-wechat` → iLink。
 
 - **历史同步**：专属助手第一次处理某会话（首批被 ack）前，每次唤醒都带完整 `hist[sid]`（该批**之前**的全部轮次，连续重复的助手回复已合并）；ack 之后改发 `thread`，历史由助手自己的持久会话承载（LLM 在它那一侧已有完整上文）。插件本地仍保存全部轮次作为备份
 - 收到 `hist`：它是该会话的完整上文，随消息一并交给专属助手；收到 `thread`：直接在助手原会话里续聊，**不要新开会话**
-- 未登记专属助手的账号：始终带完整 `hist`
+- 未登记专属助手的账号：始终带完整 `hist`；若 payload 的 `asst` 为空，就由你直接回复（不转交）
+- `warn: assistant_missing:<名>`：该号的专属助手已被删/不回复，插件已自动清掉登记。直接回复当前消息，并告诉用户重建专属助手后 `wechat_set_dedicated_assistant`
 - 助手会话被重置/丢失：重新 `wechat_set_dedicated_assistant`（同名即可），下一次唤醒会重发完整 `hist`
 - 当前消息在 `msgs`
 - 连发的多条消息合并为一次唤醒，按 `msgs` 顺序一起处理、一次回复即可
 - `media[].path` 是本机文件路径
+
+## 事件 payload（无 `msgs`）
+
+- `event: "login_expired"`：该号微信登录已过期，收不到消息。**告知用户**，然后 `wechat_login_start` → 立刻 `wechat_login_wait`，让用户重新扫码。每 30 分钟最多提醒 6 次，恢复后自动停止
+- 事件 payload 不需要 `wechat_ack`
+
+## 访问控制
+
+默认拒绝：只处理账号主人（扫码的微信）和 allowlist 内的人。陌生人的消息被丢弃，`wechat_status.blocked` 列出最近被拦的人；用户同意后 `wechat_approve(user_id)`
 
 ## 流程
 

@@ -16,6 +16,7 @@ import {
   requireAccount,
   resolveAccountForPeer,
   saveGlobalWake,
+  listBlocked,
   resetSeeded,
   saveStateSecure,
   updateState,
@@ -563,8 +564,11 @@ export function statusPayload() {
     accounts: accounts.map((a) => ({
       bot: a.ilinkBotId,
       asst: a.dedicatedAssistant?.name || "",
+      asst_lost: a.lostAssistant?.name || a.lostAssistant?.id || undefined, // stopped replying; re-register
+      expired: a.expiredAt ? true : undefined, // login expired: re-scan with wechat_login_start
       peers: Object.keys(a.contextTokens || {}).length,
     })),
+    blocked: listBlocked().slice(0, 5), // senders not on the allowlist: approve with wechat_approve
     inbox: peekInboxCount(),
   };
 }
@@ -613,6 +617,7 @@ export function setDedicatedAssistant(ilink_bot_id, assistant_id, assistant_name
       id: assistant_id || hit.dedicatedAssistant?.id || "",
       name: assistant_name,
     };
+    hit.lostAssistant = null;
     return s;
   });
   saveStateSecure(loadState());

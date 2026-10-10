@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 import {
   ackInbox,
   appendInbox,
+  appendSeenKeys,
   appendTalk,
+  clearBlocked,
   clearPid,
   findAccount,
   getAccountAssistant,
@@ -14,9 +16,14 @@ import {
   isAllowed,
   lastAssistantAt,
   listAccounts,
+  listBlocked,
+  listInboxRaw,
+  loadSeenKeys,
   loadState,
+  markAssistantLost,
   monitorRunning,
   packMsgs,
+  noteBlocked,
   paths,
   peekInbox,
   removeAccount,
@@ -49,8 +56,9 @@ const DEBUG = process.env.GROK_WECHAT_DEBUG === "1";
 function dlog(line) {
   if (!DEBUG) return;
   try {
-    fs.mkdirSync("/workspace/.grok-wechat", { recursive: true });
-    fs.appendFileSync("/workspace/.grok-wechat/mcp-host.log", `${new Date().toISOString()} ${line}\n`);
+    const { home, debug } = paths();
+    fs.mkdirSync(home, { recursive: true });
+    fs.appendFileSync(debug, `${new Date().toISOString()} ${line}\n`);
   } catch { /* ignore */ }
 }
 dlog(`spawn pid=${process.pid} argv=${JSON.stringify(process.argv)} cwd=${process.cwd()}`);
@@ -269,7 +277,7 @@ const tools = {
     },
   },
   wechat_approve: {
-    description: "Allowlist add/clear. Empty=accept all.",
+    description: "Allowlist (default-deny; the account owner is always allowed). user_id=allow that sender; clear=empty the list. No args: list allow_from + recently blocked senders.",
     inputSchema: {
       type: "object",
       properties: {
@@ -283,7 +291,8 @@ const tools = {
         else if (user_id && !s.allowFrom.includes(user_id)) s.allowFrom.push(user_id);
         return s;
       });
-      return ok({ allow_from: state.allowFrom });
+      if (user_id && !clear) clearBlocked(user_id);
+      return ok({ allow_from: state.allowFrom, blocked: listBlocked() });
     },
   },
   wechat_uninstall: {
@@ -327,7 +336,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.7.1" },
+        serverInfo: { name: "grok-wechat", version: "1.8.0" },
       },
     };
   }
@@ -408,15 +417,26 @@ const TYPING_MAX_MS = 180_000;
 const SUPERVISE_MS = 5_000;
 const ABANDON_CHECK_MS = 15_000;
 const SEEN_MAX = 2_000;
+// Dedicated-assistant health: a wake that is still unanswered after STALE counts as a strike;
+// STRIKES in a row (or one wake unanswered for DEAD) means the assistant is gone.
+const ASSISTANT_STALE_MS = 120_000;
+const ASSISTANT_DEAD_MS = 300_000;
+const ASSISTANT_STRIKES = 3;
+// Login expiry: tell the agent (so it can tell you to re-scan), then remind periodically.
+const EXPIRED_RETRY_MS = 60_000;
+const EXPIRED_NOTIFY_EVERY_MS = 30 * 60_000;
+const EXPIRED_NOTIFY_MAX = 6;
 
 const errText = (err) => (err instanceof Error ? err.message : String(err));
 
 // --- inbound dedupe (iLink may redeliver after a cursor reset) ---------------
+// Kept in memory for speed and persisted (seen.log) once a message is safely in the inbox,
+// so a restart can't make the same message get answered twice.
 const seenIds = new Set();
+const seenKey = (m) => (m.message_id ? `${m.ilink_bot_id}:${m.message_id}` : "");
 function isNewInbound(m) {
-  const id = m.message_id;
-  if (!id) return true;
-  const key = `${m.ilink_bot_id}:${id}`;
+  const key = seenKey(m);
+  if (!key) return true;
   if (seenIds.has(key)) return false;
   seenIds.add(key);
   if (seenIds.size > SEEN_MAX) seenIds.delete(seenIds.values().next().value);
@@ -478,7 +498,7 @@ async function postWake(cfg, body, botId, log) {
     if (delay) await sleep(delay);
     try {
       const r = await postOnce(cfg, body);
-      log(`wake bot=${botId} n=${body.n} ${r.status} ${r.text.slice(0, 100)}`);
+      log(`wake bot=${botId} n=${body.n ?? body.event} ${r.status} ${r.text.slice(0, 100)}`);
       if (r.ok) return true;
       if (r.status >= 400 && r.status < 500 && r.status !== 429) return false;
     } catch (err) {
@@ -496,7 +516,7 @@ async function wakeBot(botId, batch, log) {
   const cfg = resolveWakeForAccount(account);
   if (!cfg) {
     log(`wake skipped bot=${botId}: no wake config`);
-    return true; // nothing to retry
+    return null; // nothing to retry or watch
   }
   const dedicated = getAccountAssistant(state, botId);
   const packed = packMsgs(batch, state);
@@ -507,9 +527,21 @@ async function wakeBot(botId, batch, log) {
     asst: dedicated?.name || "",
     asst_id: dedicated?.id || "",
     ...packed,
+    warn: account?.lostAssistant
+      ? `assistant_missing:${account.lostAssistant.name || account.lostAssistant.id} - tell the user; recreate it and wechat_set_dedicated_assistant`
+      : undefined,
     ack: "wechat_ack",
   };
   return postWake(cfg, slim(body), botId, log);
+}
+
+/** Non-message wake (e.g. login expired) so the agent can tell the user. */
+async function wakeEvent(botId, event, extra, log) {
+  const state = loadState();
+  const cfg = resolveWakeForAccount(findAccount(state, { ilink_bot_id: botId }));
+  if (!cfg) return null;
+  const dedicated = getAccountAssistant(state, botId);
+  return postWake(cfg, slim({ src: "grok-wechat", event, bot: botId, asst: dedicated?.name || "", asst_id: dedicated?.id || "", ...extra }), botId, log);
 }
 
 async function wakeAgent(messages, log) {
@@ -519,18 +551,19 @@ async function wakeAgent(messages, log) {
     if (!byBot.has(botId)) byBot.set(botId, []);
     byBot.get(botId).push(m);
   }
-  await Promise.all([...byBot.entries()].map(async ([botId, batch]) => {
-    const ok = await wakeBot(botId, batch, log);
-    if (!ok) {
-      // Stays in the inbox (un-acked); keep retrying in the background.
-      failedWakes.push({
-        botId,
-        ids: batch.map((m) => m.id).filter(Boolean),
-        tries: 0,
-        next: Date.now() + WAKE_RETRY_INTERVAL_MS,
-      });
-    }
-  }));
+  await Promise.all([...byBot.entries()].map(([botId, batch]) => wakeAndTrack(botId, batch, log)));
+}
+
+/** Wake once; on failure queue a background retry, on success watch for a reply. */
+async function wakeAndTrack(botId, batch, log) {
+  const ok = await wakeBot(botId, batch, log);
+  const ids = batch.map((m) => m.id).filter(Boolean);
+  if (ok === false) {
+    // Stays in the inbox (un-acked); keep retrying in the background.
+    failedWakes.push({ botId, ids, tries: 0, next: Date.now() + WAKE_RETRY_INTERVAL_MS });
+  } else if (ok === true && ids.length) {
+    watches.push({ botId, ids, at: Date.now(), struck: false });
+  }
 }
 
 async function retryFailedWakes(log) {
@@ -546,7 +579,67 @@ async function retryFailedWakes(log) {
     f.tries += 1;
     f.next = now + WAKE_RETRY_INTERVAL_MS;
     const ok = await wakeBot(f.botId, still, log);
-    if (ok) failedWakes.splice(i, 1);
+    if (ok !== false) {
+      failedWakes.splice(i, 1);
+      if (ok === true) watches.push({ botId: f.botId, ids: still.map((m) => m.id).filter(Boolean), at: Date.now(), struck: false });
+    }
+  }
+}
+
+// --- dedicated-assistant health -----------------------------------------------
+const watches = []; // { botId, ids, at, struck } - successful wakes still waiting for a reply
+const strikes = new Map(); // botId -> consecutive wakes that went unanswered
+
+/** Unanswered = still in the inbox and no reply has been sent since it was received. */
+const isUnanswered = (m) => typeof m.recv_at === "number" && lastAssistantAt(m.ilink_bot_id, m.from_user_id) < m.recv_at;
+
+async function demoteAssistant(botId, log) {
+  const lost = markAssistantLost(botId);
+  strikes.delete(botId);
+  for (let i = watches.length - 1; i >= 0; i--) if (watches[i].botId === botId) watches.splice(i, 1);
+  if (!lost) return;
+  log(`ALERT dedicated assistant "${lost.name || lost.id}" is not replying bot=${botId}: registration cleared, next wakes carry full history. Recreate it and run wechat_set_dedicated_assistant`);
+  const rows = listInboxRaw().filter((m) => m.ilink_bot_id === botId && isUnanswered(m));
+  if (rows.length) await wakeAndTrack(botId, rows, log);
+}
+
+async function checkAssistantHealth(log) {
+  const now = Date.now();
+  for (let i = watches.length - 1; i >= 0; i--) {
+    const w = watches[i];
+    if (!getAccountAssistant(loadState(), w.botId)) {
+      watches.splice(i, 1); // nothing to demote
+      continue;
+    }
+    if (!inboxByIds(w.ids).some(isUnanswered)) {
+      strikes.delete(w.botId); // replied or acked: the assistant is alive
+      watches.splice(i, 1);
+      continue;
+    }
+    const age = now - w.at;
+    if (age < ASSISTANT_STALE_MS) continue;
+    if (!w.struck) {
+      w.struck = true;
+      strikes.set(w.botId, (strikes.get(w.botId) || 0) + 1);
+      log(`WARN no reply ${Math.round(age / 1000)}s after wake bot=${w.botId} strike=${strikes.get(w.botId)}/${ASSISTANT_STRIKES}`);
+    }
+    if ((strikes.get(w.botId) || 0) >= ASSISTANT_STRIKES || age >= ASSISTANT_DEAD_MS) {
+      await demoteAssistant(w.botId, log);
+    }
+  }
+}
+
+/** After a restart the in-memory retry queue is gone: re-wake what is still unanswered. */
+async function recoverInbox(log) {
+  const byBot = new Map();
+  for (const m of listInboxRaw().filter(isUnanswered)) {
+    const botId = m.ilink_bot_id || "";
+    if (!byBot.has(botId)) byBot.set(botId, []);
+    byBot.get(botId).push(m);
+  }
+  for (const [botId, batch] of byBot) {
+    log(`recover: re-waking ${batch.length} unanswered message(s) bot=${botId}`);
+    await wakeAndTrack(botId, batch, log);
   }
 }
 
@@ -589,6 +682,7 @@ async function flush(botId, log) {
   batch.forEach((m, i) => {
     if (stored[i]?.id) m.id = stored[i].id;
   });
+  appendSeenKeys(batch.map(seenKey).filter(Boolean), SEEN_MAX);
   log(`inbox +${batch.length} bot=${botId}`);
   await wakeAgent(batch, log);
 }
@@ -614,9 +708,48 @@ async function pollAccount(account, log) {
     log(`session expired bot=${account.ilinkBotId}`);
     return { messages: [], expired: true };
   }
+  if (account.expiredAt) {
+    updateState((s) => {
+      const hit = findAccount(s, { token: account.token });
+      if (hit) hit.expiredAt = 0;
+      return s;
+    });
+    expiryNotes.delete(account.token);
+    log(`login restored bot=${account.ilinkBotId}`);
+  }
   const collected = await collectInbound(raw.msgs || [], account);
   const state = loadState();
-  return { messages: collected.messages.filter((m) => isAllowed(state, m.from_user_id)), expired: false };
+  const messages = [];
+  for (const m of collected.messages) {
+    if (isAllowed(state, m.from_user_id)) {
+      messages.push(m);
+    } else {
+      noteBlocked(account.ilinkBotId, m.from_user_id);
+      log(`blocked from=${m.from_user_id} bot=${account.ilinkBotId}: not on the allowlist (wechat_approve to allow)`);
+    }
+  }
+  return { messages, expired: false };
+}
+
+// --- login expiry -------------------------------------------------------------
+const expiryNotes = new Map(); // token -> { n, last }
+
+async function handleExpired(account, log) {
+  const token = account.token;
+  if (!account.expiredAt) {
+    updateState((s) => {
+      const hit = findAccount(s, { token });
+      if (hit) hit.expiredAt = Date.now();
+      return s;
+    });
+  }
+  const note = expiryNotes.get(token) || { n: 0, last: 0 };
+  if (note.n >= EXPIRED_NOTIFY_MAX || Date.now() - note.last < EXPIRED_NOTIFY_EVERY_MS) return;
+  expiryNotes.set(token, { n: note.n + 1, last: Date.now() });
+  log(`ALERT login expired bot=${account.ilinkBotId}: WeChat no longer receives messages; re-scan needed (notice ${note.n + 1}/${EXPIRED_NOTIFY_MAX})`);
+  await wakeEvent(account.ilinkBotId, "login_expired", {
+    hint: "WeChat login expired - no messages arrive. Tell the user, then wechat_login_start and immediately wechat_login_wait so they re-scan the QR code.",
+  }, log);
 }
 
 const loops = new Map(); // token -> { stop }
@@ -633,7 +766,8 @@ async function accountLoop(token, ctl, log) {
       const r = await pollAccount(account, log);
       failures = 0;
       if (r.expired) {
-        await sleep(60_000);
+        await handleExpired(account, log).catch((err) => log(`expiry notice error ${errText(err)}`));
+        await sleep(EXPIRED_RETRY_MS);
         continue;
       }
       if (r.messages.length) enqueue(account.ilinkBotId, r.messages, log);
@@ -652,6 +786,7 @@ async function runMonitor() {
     logStream.write(`${new Date().toISOString()} ${line}\n`);
   };
   log("monitor start");
+  for (const key of loadSeenKeys(SEEN_MAX)) seenIds.add(key);
   const onExit = async () => {
     await Promise.all(listAccounts().map((a) => notifyStop(a)));
     clearPid();
@@ -691,8 +826,10 @@ async function runMonitor() {
       }
     }
     retryFailedWakes(log).catch((err) => log(`wake retry error ${errText(err)}`));
+    checkAssistantHealth(log).catch((err) => log(`assistant health error ${errText(err)}`));
   };
 
+  recoverInbox(log).catch((err) => log(`recover error ${errText(err)}`));
   supervise();
   setInterval(supervise, SUPERVISE_MS);
   setInterval(typingTick, TYPING_KEEPALIVE_MS);

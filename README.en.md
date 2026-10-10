@@ -15,7 +15,8 @@ WeChat iLink channel for Grok Bot. After QR bind, DMs wake the matching **dedica
 - **Webhook carries the message**: the wake payload includes `msgs`. Full history is synced **once** to the account's dedicated assistant (`hist`, uncapped); after the assistant has handled and replied in the conversation (an ack with no reply sent since does not count as synced), its persistent thread carries it and the payload only marks `thread` instead of resending. The plugin always keeps every turn locally, and the agent can skip `wechat_inbox`
 - **Low latency**: every account long-polls independently; DMs sent within 600ms are merged into one wake; typing turns on immediately and is kept alive every 5s until the reply
 - **Reliable delivery**: `wechat_inbox` only peeks, `wechat_ack` removes after a successful reply; inbox writes are cross-process locked; failed wakes are retried; inbound is deduped by `message_id`
-- **Allowlist**: empty means accept every DM; once set, only listed users are handled
+- **Allowlist (default-deny)**: only the account owner (the WeChat user who scanned) and listed users are handled; strangers are dropped and shown in `wechat_status.blocked`, then allowed with `wechat_approve`
+- **Self-healing**: a dead/unresponsive dedicated assistant (3 consecutive wakes unanswered for 2 min, or 5 min with no reply) is cleared automatically, full history is resent and the payload carries `warn`; after a monitor restart unanswered wakes are re-sent; handled message ids are persisted for dedupe; an expired WeChat login wakes the agent (`event: login_expired`) so you get asked to re-scan
 - **Global webhook**: paste once; it covers every current and future bound account
 
 ## One-line install
@@ -54,7 +55,7 @@ Talk in WeChat as usual:
 
 WeChat shows typing as soon as the message is accepted. Text, voice transcriptions, images, videos, and files are all handled; outbound media uses a local file path on the Grok Bot machine. Multi-turn DMs from the same peer include prior `history` so context stays in that account's dedicated assistant session.
 
-To restrict who can talk, have the assistant add them to the allowlist. To unbind one number, ask to log that WeChat account out; omit the account to log all of them out.
+By default only you (the WeChat user who scanned) can talk to the bot; to let others in, have the assistant `wechat_approve` them (blocked senders are listed in `wechat_status` under `blocked`). To unbind one number, ask to log that WeChat account out; omit the account to log all of them out.
 
 ## Multiple accounts
 
