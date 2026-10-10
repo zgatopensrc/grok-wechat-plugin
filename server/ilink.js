@@ -7,6 +7,7 @@ import {
   emptyAccount,
   findAccount,
   hasGlobalWake,
+  resolveWakeForAccount,
   listAccounts,
   loadState,
   localTokenList,
@@ -560,9 +561,10 @@ export function statusPayload() {
   return {
     logged_in: accounts.length > 0,
     n: accounts.length,
-    wake: hasGlobalWake(),
+    wake: accounts.length > 0 && accounts.every((a) => resolveWakeForAccount(a)), // every account has a webhook
     accounts: accounts.map((a) => ({
       bot: a.ilinkBotId,
+      wake: a.wake?.url ? "own" : hasGlobalWake() ? "global" : undefined, // own = straight to its assistant
       asst: a.dedicatedAssistant?.name || "",
       asst_lost: a.lostAssistant?.name || a.lostAssistant?.id || undefined, // stopped replying; re-register
       expired: a.expiredAt ? true : undefined, // login expired: re-scan with wechat_login_start

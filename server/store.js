@@ -797,6 +797,21 @@ export function resolveWakeForAccount(account) {
   return loadFallbackWake();
 }
 
+/** Drop one account's own webhook so it falls back to the global one. Returns true if it had one. */
+export function clearAccountWake(ilink_bot_id) {
+  let had = false;
+  updateState((s) => {
+    const a = findAccount(s, { ilink_bot_id });
+    if (a?.wake) {
+      had = true;
+      a.wake = null;
+    }
+    return s;
+  });
+  if (had) saveStateSecure(loadState());
+  return had;
+}
+
 export function hasAccountWake(account) {
   return hasGlobalWake() || Boolean(account?.wake?.url && account?.wake?.key);
 }

@@ -2,7 +2,7 @@
 
 [中文](README.md) | [English](README.en.md)
 
-WeChat iLink channel for Grok Bot. After QR bind, DMs wake the matching **dedicated assistant** via a shared webhook. The assistant can reply with text or media. Typing turns on automatically when a message is accepted; each WeChat account gets one assistant that keeps session context.
+WeChat iLink channel for Grok Bot. After QR bind, DMs wake the matching **dedicated assistant** directly through that account's own webhook. The assistant can reply with text or media. Typing turns on automatically when a message is accepted; each WeChat account gets one assistant that keeps session context.
 
 ## Capabilities
 
@@ -17,7 +17,7 @@ WeChat iLink channel for Grok Bot. After QR bind, DMs wake the matching **dedica
 - **Reliable delivery**: `wechat_inbox` only peeks, `wechat_ack` removes after a successful reply; inbox writes are cross-process locked; failed wakes are retried; inbound is deduped by `message_id`
 - **Allowlist (default-deny)**: only the account owner (the WeChat user who scanned) and listed users are handled; strangers are dropped and shown in `wechat_status.blocked`, then allowed with `wechat_approve`
 - **Self-healing**: a dead/unresponsive dedicated assistant (3 consecutive wakes unanswered for 2 min, or 5 min with no reply) is cleared automatically, full history is resent and the payload carries `warn`; after a monitor restart unanswered wakes are re-sent; handled message ids are persisted for dedupe; an expired WeChat login wakes the agent (`event: login_expired`) so you get asked to re-scan
-- **Global webhook**: paste once; it covers every current and future bound account
+- **Per-account webhook straight to the dedicated assistant**: each account's webhook Routine lives under its own dedicated assistant, so a wake goes directly into that assistant with **no dispatcher agent** (one less cold start and hand-off). A global webhook is only a fallback for accounts without their own
 
 ## One-line install
 
@@ -36,14 +36,14 @@ Follow the conversation. The full flow looks like this:
 1. **Confirm the channel**  
    Tap **加** in the chat to attach the WeChat channel to Grok Bot.
 
-2. **Connector and shared routines**  
-   The installing assistant adds the WeChat connector and creates two routines: **「微信入站唤醒」** (webhook) and **「微信监听保活」** (every 5 minutes, `wechat_start_monitor`). Creating the webhook routine does not return url/key to the agent; the user copies them once from that routine's panel and sends them. The assistant calls `wechat_set_wake` to write global `wake.json` for all current and future bound accounts.
+2. **Connector and keepalive routine**  
+   The installing assistant adds the WeChat connector and creates the routine **「微信监听保活」** (every 20 minutes, `wechat_start_monitor`).
 
-3. **Scan to log in**  
-   `wechat_login_start` shows a QR code, then immediately `wechat_login_wait` until `logged_in=true`. After each bind, **create a dedicated Grok Bot assistant** for that WeChat number and call `wechat_set_dedicated_assistant` with its id and name; dedicated assistants do not create inbound routines. Bind more accounts by repeating start and wait — no second webhook paste.
+3. **Scan to log in, then set up each account's assistant**  
+   `wechat_login_start` shows a QR code, then immediately `wechat_login_wait` until `logged_in=true`. After each bind: create that number's **dedicated Grok Bot assistant**; create a webhook routine **under that assistant**, 「微信入站唤醒-<assistant name>」; creating it does not return url/key to the agent, so copy them from that routine's panel and send them; the installing assistant calls `wechat_set_wake` with that account's `ilink_bot_id` (its own webhook), then `wechat_set_dedicated_assistant` with the assistant's id and name. Repeat for every additional account.
 
 4. **Binding complete**  
-   `wechat_status` shows `global_wake_configured=true` and each account's `dedicated_assistant_name`. Inbound: installing assistant `wechat_inbox`, then forwards by `ilink_bot_id` to that account's dedicated assistant with `history`.
+   `wechat_status` shows each account's `wake: "own"` and its dedicated assistant name. Inbound: the plugin POSTs that account's own webhook, which wakes its dedicated assistant directly — no dispatcher.
 
 When someone DMs you on WeChat, the bot can reply there.
 
@@ -59,11 +59,11 @@ By default only you (the WeChat user who scanned) can talk to the bot; to let ot
 
 ## Multiple accounts
 
-One connector binds multiple WeChat personal accounts. One global webhook covers all of them; each new bind gets its own QR scan and dedicated assistant. `wechat_status` shows `global_wake_configured` and per-account dedicated assistant names.
+One connector binds multiple WeChat personal accounts. Each account has its own QR scan, its own dedicated assistant and its own webhook (`wechat_set_wake` with `ilink_bot_id`). `wechat_status` shows each account's `wake` (`own`/`global`) and dedicated assistant name.
 
 ## Flow
 
-WeChat DM → monitor inbox (auto typing) → POST shared webhook → installing assistant wakes → `wechat_inbox` (with history) → forward by `ilink_bot_id` to dedicated assistant → `wechat_send` / `wechat_send_media`
+WeChat DM → monitor inbox (auto typing) → POST that account's own webhook → its dedicated assistant wakes (payload has msgs, full hist the first time) → `wechat_send` / `wechat_send_media` → `wechat_ack`
 
 After a task finishes, reply immediately.
 
@@ -83,7 +83,7 @@ The installing assistant will:
 
 1. Call `wechat_uninstall` to clean the machine and read `dedicated_assistants_sidebar_delete` for dedicated assistant names.
 2. Remove the `grok-wechat` connector.
-3. Delete Routine「微信入站唤醒」and「微信监听保活」on the installing assistant, and remove any leftover copies on other assistants.
+3. Delete Routine「微信监听保活」and each 「微信入站唤醒-<assistant name>」 (plus the old global 「微信入站唤醒」 if present).
 4. Tell the user to right-click → Delete the dedicated assistants listed in the uninstall response (e.g. 微信1, 微信2) in the sidebar.
 
-Removing the connector from Settings also triggers local monitor cleanup. After a clean uninstall, reinstall requires a fresh webhook paste and QR scan; `wechat_status` shows zero accounts.
+Removing the connector from Settings also triggers local monitor cleanup. After a clean uninstall, reinstall requires a fresh per-account webhook and QR scan; `wechat_status` shows zero accounts.

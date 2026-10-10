@@ -7,11 +7,13 @@ import {
   appendInbox,
   appendSeenKeys,
   appendTalk,
+  clearAccountWake,
   clearBlocked,
   clearPid,
   findAccount,
   getAccountAssistant,
   getTalkCount,
+  hasGlobalWake,
   inboxByIds,
   isAllowed,
   lastAssistantAt,
@@ -239,7 +241,7 @@ const tools = {
     handle: async () => ok(ensureMonitor()),
   },
   wechat_set_wake: {
-    description: "Save global wake webhook url+key.",
+    description: "Save wake webhook url+key. With ilink_bot_id: that account's own webhook, created under its dedicated assistant so wakes go straight to it (no dispatcher). Without: global fallback for accounts that have none.",
     inputSchema: {
       type: "object",
       properties: {
@@ -336,7 +338,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.8.0" },
+        serverInfo: { name: "grok-wechat", version: "1.9.0" },
       },
     };
   }
@@ -586,6 +588,14 @@ async function retryFailedWakes(log) {
     const still = inboxByIds(f.ids); // acked/handled messages drop out
     if (!still.length || f.tries >= WAKE_RETRY_MAX) {
       failedWakes.splice(i, 1);
+      if (still.length) {
+        // Its own webhook never accepts wakes (e.g. the assistant/Routine was deleted): treat the assistant as gone.
+        const account = findAccount(loadState(), { ilink_bot_id: f.botId });
+        if (account?.wake?.url && getAccountAssistant(loadState(), f.botId)) {
+          log(`WARN own webhook failed ${WAKE_RETRY_MAX}x bot=${f.botId}`);
+          await demoteAssistant(f.botId, log);
+        }
+      }
       continue;
     }
     f.tries += 1;
@@ -610,6 +620,8 @@ async function demoteAssistant(botId, log) {
   strikes.delete(botId);
   for (let i = watches.length - 1; i >= 0; i--) if (watches[i].botId === botId) watches.splice(i, 1);
   if (!lost) return;
+  // Its own webhook belonged to that assistant; fall back to the global one if there is one.
+  if (hasGlobalWake() && clearAccountWake(botId)) log(`own webhook cleared bot=${botId}: falling back to the global webhook`);
   log(`ALERT dedicated assistant "${lost.name || lost.id}" is not replying bot=${botId}: registration cleared, next wakes carry full history. Recreate it and run wechat_set_dedicated_assistant`);
   const rows = listInboxRaw().filter((m) => m.ilink_bot_id === botId && isUnanswered(m));
   if (rows.length) await wakeAndTrack(botId, rows, log);
