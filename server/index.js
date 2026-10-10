@@ -338,7 +338,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.9.0" },
+        serverInfo: { name: "grok-wechat", version: "1.9.1" },
       },
     };
   }
