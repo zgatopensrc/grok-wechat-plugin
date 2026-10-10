@@ -327,7 +327,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.7.1" },
+        serverInfo: { name: "grok-wechat", version: "1.7.2" },
       },
     };
   }
@@ -394,11 +394,23 @@ function startMcp() {
 
 
 // ---------------------------------------------------------------------------
-// Monitor: one independent long-poll loop per account, a short debounce to merge
+// Monitor: one independent long-poll loop per account, a coalesce window to merge
 // bursts into one wake, typing keepalive, and wake retry.
 // ---------------------------------------------------------------------------
 
-const COALESCE_MS = 600;
+const DEFAULT_COALESCE_MS = 3000;
+
+/** Non-negative integer milliseconds. Unset, blank, or invalid values use the default. */
+function readCoalesceMs(raw = process.env.GROK_WECHAT_COALESCE_MS) {
+  if (raw == null) return DEFAULT_COALESCE_MS;
+  const text = String(raw).trim();
+  if (!/^\d+$/.test(text)) return DEFAULT_COALESCE_MS;
+  const n = Number(text);
+  if (!Number.isSafeInteger(n)) return DEFAULT_COALESCE_MS;
+  return n;
+}
+
+const COALESCE_MS = readCoalesceMs();
 const WAKE_TIMEOUT_MS = 12_000;
 const WAKE_ATTEMPT_DELAYS_MS = [0, 1_500, 4_000];
 const WAKE_RETRY_INTERVAL_MS = 30_000;
