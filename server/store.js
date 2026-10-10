@@ -512,23 +512,41 @@ export function formatAgentMsg(msg, state = loadState()) {
   });
 }
 
+// Recent-context floor embedded in each payload so short follow-ups ("好的", "继续")
+// work even if the agent never calls wechat_history. Display-only: storage is untouched.
+const TAIL_TURNS = 6;
+const TAIL_CHARS = 500;
+
 /**
- * Agent payload: `msgs` plus `prior[sid]` = how many turns of that conversation exist
- * before this batch. History is NOT embedded (it is already stored on disk at receive
- * time); the agent fetches what it needs verbatim via `wechat_history`.
+ * Agent payload: `msgs`, `prior[sid]` (turn count before this batch) and `recent[sid]`
+ * (the last few turns before the batch, `{i,r,t}`; `x` = original length when `t` was
+ * shortened for display). Everything older, or any shortened turn, is fetched verbatim
+ * via `wechat_history`. Nothing is dropped from storage.
  */
 export function packMsgs(rawMsgs, state = loadState()) {
-  const priorBySid = {};
+  const bySid = new Map(); // sid -> { bot, from, n }
   for (const m of rawMsgs) {
     const sid = m.session_id || talkKey(m.ilink_bot_id, m.from_user_id);
     const n = typeof m.hist_n === "number" ? m.hist_n : getTalkCount(m.ilink_bot_id, m.from_user_id);
-    priorBySid[sid] = Math.min(priorBySid[sid] ?? Number.POSITIVE_INFINITY, n);
+    const cur = bySid.get(sid);
+    bySid.set(sid, { bot: m.ilink_bot_id, from: m.from_user_id, n: cur ? Math.min(cur.n, n) : n });
   }
   const prior = {};
-  for (const [sid, n] of Object.entries(priorBySid)) if (n > 0) prior[sid] = n;
+  const recent = {};
+  for (const [sid, { bot, from, n }] of bySid) {
+    if (n <= 0) continue;
+    prior[sid] = n;
+    const { turns } = queryTalk(bot, from, { before: n, limit: TAIL_TURNS });
+    if (turns.length) {
+      recent[sid] = turns.map((t) =>
+        t.t.length > TAIL_CHARS ? { i: t.i, r: t.r, t: `${t.t.slice(0, TAIL_CHARS)}…`, x: t.t.length } : t,
+      );
+    }
+  }
   return slim({
     msgs: rawMsgs.map((m) => formatAgentMsg(m, state)),
     prior: Object.keys(prior).length ? prior : undefined,
+    recent: Object.keys(recent).length ? recent : undefined,
   });
 }
 

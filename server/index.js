@@ -171,7 +171,7 @@ const tools = {
     },
   },
   wechat_inbox: {
-    description: "Peek inbox (does NOT clear). Returns msgs[{id,from,bot,text,media,sid,asst}] + prior{sid:turn_count} (history is NOT embedded; fetch with wechat_history). Prefer the wake payload if present. After replying call wechat_ack.",
+    description: "Peek inbox (does NOT clear). Returns msgs[{id,from,bot,text,media,sid,asst}] + prior{sid:turn_count} + recent{sid:[{i,r,t,x?}]} (last few turns only; older/shortened turns via wechat_history). Prefer the wake payload if present. After replying call wechat_ack.",
     inputSchema: { type: "object", properties: {} },
     handle: async () => ok({ ...peekInbox(), ack: "wechat_ack" }),
   },
@@ -357,7 +357,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.6.0" },
+        serverInfo: { name: "grok-wechat", version: "1.6.1" },
       },
     };
   }

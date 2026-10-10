@@ -6,7 +6,7 @@ description: 安装/登录/收发/卸载微信 iLink。入站 webhook 带正文+
 
 MCP `grok-wechat` → iLink。
 
-`私信 → monitor(立即 typing，保活至回复) → 600ms 合并连发 → webhook(msgs+prior) → 回复 wechat_send → wechat_ack`
+`私信 → monitor(立即 typing，保活至回复) → 600ms 合并连发 → webhook(msgs+recent) → 回复 wechat_send → wechat_ack`
 
 立刻回复。typing 由 monitor 自动开启并每 5s 保活，`wechat_send` 后自动关闭，**无需**再调 `wechat_typing`。
 
@@ -26,19 +26,22 @@ MCP `grok-wechat` → iLink。
 ```
 { src, n, bot, asst, asst_id,
   msgs: [{ id, from, bot, text?, media?, sid, asst }],
-  prior: { "<sid>": 42 },   // 该会话在本批之前已有多少轮历史（历史不随 payload 下发）
+  prior:  { "<sid>": 42 },                          // 本批之前该会话共有多少轮
+  recent: { "<sid>": [{ i, r:"u"|"a", t, x? }] },   // 其中最近 6 轮；x = t 被缩短前的原长
   ack: "wechat_ack" }
 ```
 
-- 消息在收到时就已完整落盘；payload **不带历史**，只带 `prior[sid]`（之前的轮数）
-- `prior[sid]` 为空/缺失 = 新对话，无需查历史
-- 回复依赖上文（指代、「上次说的…」、「好的/继续」等）时，先调 `wechat_history`：`sid` 不带 query 取最近若干轮（如 `limit:20`），或 `sid`+`query` 搜索，或 `before=<首条 i>` 向前翻页。返回**原文、不摘要**，整段历史都能取到；自包含的问题不要调用（省 token）
+- 消息收到即完整落盘；payload 只带最近 6 轮 `recent`（每条 >500 字会缩短并带 `x`）和总轮数 `prior`，更早的历史**不下发**
+- `prior` 缺失 = 新对话，无需查历史
+- 「好的/继续/那个呢」这类短跟进，`recent` 通常够用
+- **必须调 `wechat_history`** 的情况：用户提到 `recent` 里没有的旧内容（「上次说的…」「之前那个…」）、`recent` 看不出指代、或需要某条 `x` 被缩短的原文。用法：`sid`+`query` 搜索（可加 `context`），或 `before=<最早 i>` 向前翻页，或 `before=i+1,limit:1` 取被缩短那条。返回**原文、不摘要**，整段历史都能取到
+- 不确定就查，宁可多查一次；自包含的问题不要查（省 token）
 - 连发的多条消息合并为一次唤醒，按 `msgs` 顺序一起处理、一次回复即可
 - `media[].path` 是本机文件路径
 
 ## 流程
 
-1. 用 `msgs` 理解当前消息；需要上文时按上面的规则 `wechat_history`（webhook 缺失/失败时 `wechat_inbox`，它**只 peek 不清空**）
+1. 用 `msgs` + `recent` 理解当前消息；不够时按上面规则 `wechat_history`（webhook 缺失/失败时 `wechat_inbox`，它**只 peek 不清空**）
 2. `wechat_send`（`to_user_id=from`，带同一 `bot`）
 3. **`wechat_ack`（`ids` = msgs 的 id）**。未 ack 的消息保留；webhook 失败时 monitor 会自动重试唤醒（最多 6 次，间隔 30s）
 

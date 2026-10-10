@@ -12,7 +12,7 @@ WeChat iLink channel for Grok Bot. After QR bind, DMs wake the matching **dedica
 - **Media**: receive and send images, videos, and files (inbound media is saved locally)
 - **Typing**: turns on automatically after the monitor accepts a DM; turns off after send
 - **Session context**: full per-peer talk history, **uncapped** (append-only per-peer files); consecutive duplicate assistant replies are merged, repeated user messages are kept
-- **History on demand**: every message is saved in full when received; the wake payload carries only `msgs` and `prior` (prior turn count) and does not resend history. The agent pulls what it needs via `wechat_history` (paged or searched, verbatim, no summarizing or truncation), so it can also skip `wechat_inbox`
+- **History on demand**: every message is saved in full when received; the wake payload carries only `msgs`, `prior` (prior turn count) and the last 6 turns as `recent` (so short follow-ups like "ok"/"continue" keep context), and does not resend the full history. The agent pulls anything older via `wechat_history` (paged or searched, verbatim, no summarizing or truncation), so it can also skip `wechat_inbox`
 - **Low latency**: every account long-polls independently; DMs sent within 600ms are merged into one wake; typing turns on immediately and is kept alive every 5s until the reply
 - **Reliable delivery**: `wechat_inbox` only peeks, `wechat_ack` removes after a successful reply; inbox writes are cross-process locked; failed wakes are retried; inbound is deduped by `message_id`
 - **Allowlist**: empty means accept every DM; once set, only listed users are handled
