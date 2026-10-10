@@ -38,6 +38,8 @@ import {
 import {
   collectInbound,
   getUpdates,
+  MSG_STATE,
+  MSG_TYPE,
   loginStart,
   loginWait,
   notifyStart,
@@ -338,7 +340,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.9.1" },
+        serverInfo: { name: "grok-wechat", version: "1.10.0" },
       },
     };
   }
@@ -423,8 +425,9 @@ function readCoalesceMs(raw = process.env.GROK_WECHAT_COALESCE_MS) {
 
 const COALESCE_MS = readCoalesceMs();
 const WAKE_TIMEOUT_MS = 12_000;
-const WAKE_ATTEMPT_DELAYS_MS = [0, 1_500, 4_000];
-const WAKE_RETRY_INTERVAL_MS = 30_000;
+const WAKE_ATTEMPT_DELAYS_MS = [0, 800, 2_500];
+// Background retries (after the quick attempts failed): sooner at first, then every 30s.
+const WAKE_RETRY_INTERVALS_MS = [10_000, 20_000, 30_000];
 const WAKE_RETRY_MAX = 6;
 const TYPING_KEEPALIVE_MS = 5_000;
 const TYPING_MAX_MS = 180_000;
@@ -467,7 +470,10 @@ function startTyping(messages, log) {
     if (!m.from_user_id) continue;
     const botId = m.ilink_bot_id || "";
     const key = `${botId}::${m.from_user_id}`;
-    typingWatch.set(key, { botId, peer: m.from_user_id, since: now });
+    // Keep the earliest start of a still-unanswered conversation (reply latency is measured from it).
+    const prev = typingWatch.get(key);
+    const open = prev && lastAssistantAt(botId, m.from_user_id) < prev.since;
+    typingWatch.set(key, { botId, peer: m.from_user_id, since: open ? prev.since : now });
     if (seen.has(key)) continue;
     seen.add(key);
     setTyping(m.from_user_id, true, botId || undefined)
@@ -476,11 +482,13 @@ function startTyping(messages, log) {
   }
 }
 
-function typingTick() {
+function typingTick(log) {
   const now = Date.now();
   for (const [key, w] of typingWatch) {
     // Stop once we replied (send turns typing off) or after a hard ceiling.
-    if (now - w.since > TYPING_MAX_MS || lastAssistantAt(w.botId, w.peer) >= w.since) {
+    const repliedAt = lastAssistantAt(w.botId, w.peer);
+    if (now - w.since > TYPING_MAX_MS || repliedAt >= w.since) {
+      if (repliedAt >= w.since) log(`replied ${repliedAt - w.since}ms after receipt bot=${w.botId} peer=${w.peer}`);
       typingWatch.delete(key);
       continue;
     }
@@ -511,8 +519,9 @@ async function postWake(cfg, body, botId, log) {
   for (const delay of WAKE_ATTEMPT_DELAYS_MS) {
     if (delay) await sleep(delay);
     try {
+      const t0 = Date.now();
       const r = await postOnce(cfg, body);
-      log(`wake bot=${botId} n=${body.n ?? body.event} ${r.status} ${r.text.slice(0, 100)}`);
+      log(`wake bot=${botId} n=${body.n ?? body.event} ${r.status} ${Date.now() - t0}ms ${r.text.slice(0, 100)}`);
       if (r.ok) return true;
       if (r.status >= 400 && r.status < 500 && r.status !== 429) return false;
     } catch (err) {
@@ -574,7 +583,7 @@ async function wakeAndTrack(botId, batch, log) {
   const ids = batch.map((m) => m.id).filter(Boolean);
   if (ok === false) {
     // Stays in the inbox (un-acked); keep retrying in the background.
-    failedWakes.push({ botId, ids, tries: 0, next: Date.now() + WAKE_RETRY_INTERVAL_MS });
+    failedWakes.push({ botId, ids, tries: 0, next: Date.now() + WAKE_RETRY_INTERVALS_MS[0] });
   } else if (ok === true && ids.length) {
     watches.push({ botId, ids, at: Date.now(), struck: false });
   }
@@ -599,7 +608,7 @@ async function retryFailedWakes(log) {
       continue;
     }
     f.tries += 1;
-    f.next = now + WAKE_RETRY_INTERVAL_MS;
+    f.next = now + WAKE_RETRY_INTERVALS_MS[Math.min(f.tries, WAKE_RETRY_INTERVALS_MS.length - 1)];
     const ok = await wakeBot(f.botId, still, log);
     if (ok !== false) {
       failedWakes.splice(i, 1);
@@ -726,6 +735,25 @@ function enqueue(botId, messages, log) {
 }
 
 // --- polling -------------------------------------------------------------------
+/**
+ * Media messages are downloaded before they are collected, which can take seconds. Show
+ * "typing" as soon as such a message arrives instead of after the download.
+ */
+function earlyTyping(rawMsgs, account, log) {
+  const state = loadState();
+  const early = [];
+  for (const msg of rawMsgs) {
+    if (msg.message_type && msg.message_type !== MSG_TYPE.USER) continue;
+    if (msg.message_state && msg.message_state !== MSG_STATE.FINISH) continue;
+    const from = msg.from_user_id;
+    if (!from || !isAllowed(state, from)) continue;
+    if (!(msg.item_list || []).some((it) => it?.image_item || it?.file_item || it?.video_item)) continue;
+    if (seenIds.has(`${account.ilinkBotId}:${String(msg.message_id ?? msg.client_id ?? "")}`)) continue;
+    early.push({ from_user_id: from, ilink_bot_id: account.ilinkBotId });
+  }
+  if (early.length) startTyping(early, log);
+}
+
 async function pollAccount(account, log) {
   const raw = await getUpdates(account);
   if (raw.session_expired) {
@@ -741,6 +769,7 @@ async function pollAccount(account, log) {
     expiryNotes.delete(account.token);
     log(`login restored bot=${account.ilinkBotId}`);
   }
+  earlyTyping(raw.msgs || [], account, log);
   const collected = await collectInbound(raw.msgs || [], account);
   const state = loadState();
   const messages = [];
@@ -818,6 +847,9 @@ async function runMonitor() {
   };
   process.on("SIGTERM", onExit);
   process.on("SIGINT", onExit);
+  // A stray error must not kill polling: the next keepalive can be up to 20 minutes away.
+  process.on("uncaughtException", (err) => log(`uncaught ${errText(err)}`));
+  process.on("unhandledRejection", (err) => log(`unhandled rejection ${errText(err)}`));
 
   let lastAbandonCheck = 0;
   const supervise = () => {
@@ -856,7 +888,7 @@ async function runMonitor() {
   recoverInbox(log).catch((err) => log(`recover error ${errText(err)}`));
   supervise();
   setInterval(supervise, SUPERVISE_MS);
-  setInterval(typingTick, TYPING_KEEPALIVE_MS);
+  setInterval(() => typingTick(log), TYPING_KEEPALIVE_MS);
 }
 
 if (process.argv.includes("--monitor")) {
