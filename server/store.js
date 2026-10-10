@@ -513,26 +513,23 @@ export function formatAgentMsg(msg, state = loadState()) {
 }
 
 /**
- * Agent payload: `msgs` plus full history ONCE per conversation (`hist[sid]`),
- * not repeated on every message. History covers turns before the earliest
- * message of that conversation in this batch, so nothing is duplicated or capped.
+ * Agent payload: `msgs` plus `prior[sid]` = how many turns of that conversation exist
+ * before this batch. History is NOT embedded (it is already stored on disk at receive
+ * time); the agent fetches what it needs verbatim via `wechat_history`.
  */
 export function packMsgs(rawMsgs, state = loadState()) {
-  const firstBySid = new Map();
-  const limitBySid = new Map();
+  const priorBySid = {};
   for (const m of rawMsgs) {
     const sid = m.session_id || talkKey(m.ilink_bot_id, m.from_user_id);
-    if (!firstBySid.has(sid)) firstBySid.set(sid, m);
-    const n = typeof m.hist_n === "number" ? m.hist_n : Number.POSITIVE_INFINITY;
-    limitBySid.set(sid, Math.min(limitBySid.get(sid) ?? Number.POSITIVE_INFINITY, n));
+    const n = typeof m.hist_n === "number" ? m.hist_n : getTalkCount(m.ilink_bot_id, m.from_user_id);
+    priorBySid[sid] = Math.min(priorBySid[sid] ?? Number.POSITIVE_INFINITY, n);
   }
-  const hist = {};
-  for (const [sid, m] of firstBySid) {
-    const limit = limitBySid.get(sid);
-    const h = getTalkHistory(m.ilink_bot_id, m.from_user_id, Number.isFinite(limit) ? limit : undefined);
-    if (h.length) hist[sid] = h;
-  }
-  return slim({ msgs: rawMsgs.map((m) => formatAgentMsg(m, state)), hist: Object.keys(hist).length ? hist : undefined });
+  const prior = {};
+  for (const [sid, n] of Object.entries(priorBySid)) if (n > 0) prior[sid] = n;
+  return slim({
+    msgs: rawMsgs.map((m) => formatAgentMsg(m, state)),
+    prior: Object.keys(prior).length ? prior : undefined,
+  });
 }
 
 /** Append to inbox (locked). Returns the stored copies, each with a stable `id`. */

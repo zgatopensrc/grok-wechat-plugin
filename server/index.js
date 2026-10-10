@@ -171,7 +171,7 @@ const tools = {
     },
   },
   wechat_inbox: {
-    description: "Peek inbox (does NOT clear). Returns msgs[{id,from,bot,text,media,sid,asst}] + hist{sid:[{r,t}]} (full history, once per conversation). Prefer the wake payload if present. After replying call wechat_ack.",
+    description: "Peek inbox (does NOT clear). Returns msgs[{id,from,bot,text,media,sid,asst}] + prior{sid:turn_count} (history is NOT embedded; fetch with wechat_history). Prefer the wake payload if present. After replying call wechat_ack.",
     inputSchema: { type: "object", properties: {} },
     handle: async () => ok({ ...peekInbox(), ack: "wechat_ack" }),
   },
@@ -186,7 +186,7 @@ const tools = {
     handle: async ({ ids }) => ok(ackInbox(ids)),
   },
   wechat_history: {
-    description: "Read the FULL verbatim talk history (never summarized). Target: sid, or bot+from (from alone works if unambiguous). No query: last `limit` turns before `before`; page back with before=<first turn i>. query: most recent matching turns (+`context` turns around each). Turn i = index in wake hist[sid].",
+    description: "Read the FULL verbatim talk history (never summarized). Target: sid, or bot+from (from alone works if unambiguous). No query: last `limit` turns before `before`; page back with before=<first turn i>. query: most recent matching turns (+`context` turns around each). Turns 0..prior[sid]-1 existed before the wake batch.",
     inputSchema: {
       type: "object",
       properties: {
@@ -357,7 +357,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.5.0" },
+        serverInfo: { name: "grok-wechat", version: "1.6.0" },
       },
     };
   }
