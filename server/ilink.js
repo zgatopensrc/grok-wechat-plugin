@@ -146,9 +146,7 @@ export async function loginStart() {
   return {
     qrcode,
     image: img,
-    existing_accounts: listAccounts(state).map(accountSummary),
     next: "wechat_login_wait",
-    hint: "向用户展示二维码后，立即调用 wechat_login_wait，轮询至 logged_in=true。",
   };
 }
 
@@ -174,11 +172,9 @@ export async function loginWait(timeoutMs = 120_000, qrcodeArg) {
       });
       return {
         logged_in: true,
-        account: accountSummary(account),
         ilink_bot_id: account.ilinkBotId,
         ilink_user_id: account.ilinkUserId,
-        accounts: listAccounts(loadState()).map(accountSummary),
-        hint: "绑定完成。为该号创建专属 Grok Bot 助手（每账号一个），调用 wechat_set_dedicated_assistant 登记 assistant_id 与 assistant_name。该助手内用 history 保持会话上下文。后续扫码绑定无需再配 webhook。",
+        next: "create dedicated assistant + wechat_set_dedicated_assistant",
       };
     }
     if (last.status === "binded_redirect" && last.bot_token) {
@@ -191,11 +187,9 @@ export async function loginWait(timeoutMs = 120_000, qrcodeArg) {
       return {
         logged_in: true,
         redirected: true,
-        account: accountSummary(account),
         ilink_bot_id: account.ilinkBotId,
         ilink_user_id: account.ilinkUserId,
-        accounts: listAccounts(loadState()).map(accountSummary),
-        hint: "绑定完成。为该号创建专属 Grok Bot 助手（每账号一个），调用 wechat_set_dedicated_assistant 登记 assistant_id 与 assistant_name。该助手内用 history 保持会话上下文。后续扫码绑定无需再配 webhook。",
+        next: "create dedicated assistant + wechat_set_dedicated_assistant",
       };
     }
     if (last.status === "expired") {
@@ -304,30 +298,45 @@ function itemText(item) {
 export async function normalizeInbound(msg) {
   const from = msg.from_user_id || "";
   const items = [];
+  const downloads = [];
   let text = "";
   for (const [i, item] of (msg.item_list || []).entries()) {
     const type = item.type;
     const piece = itemText(item);
     if (piece) text = text ? `${text}\n${piece}` : piece;
     if (type === ITEM.IMAGE && item.image_item?.media) {
-      const file = await downloadMedia(item.image_item.media, `image-${i}.bin`).catch(() => null);
-      items.push({ type: "image", path: file });
+      const slot = { type: "image", path: null };
+      items.push(slot);
+      downloads.push(
+        downloadMedia(item.image_item.media, `image-${i}.bin`)
+          .then((file) => { slot.path = file; })
+          .catch(() => {}),
+      );
     } else if (type === ITEM.FILE && item.file_item) {
-      const file = await downloadMedia(item.file_item.media, item.file_item.file_name || `file-${i}`).catch(() => null);
-      items.push({ type: "file", name: item.file_item.file_name || "", path: file });
+      const slot = { type: "file", name: item.file_item.file_name || "", path: null };
+      items.push(slot);
+      downloads.push(
+        downloadMedia(item.file_item.media, item.file_item.file_name || `file-${i}`)
+          .then((file) => { slot.path = file; })
+          .catch(() => {}),
+      );
     } else if (type === ITEM.VIDEO && item.video_item?.media) {
-      const file = await downloadMedia(item.video_item.media, `video-${i}.bin`).catch(() => null);
-      items.push({ type: "video", path: file });
+      const slot = { type: "video", path: null };
+      items.push(slot);
+      downloads.push(
+        downloadMedia(item.video_item.media, `video-${i}.bin`)
+          .then((file) => { slot.path = file; })
+          .catch(() => {}),
+      );
     } else if (type === ITEM.VOICE && item.voice_item) {
-      items.push({ type: "voice", text: item.voice_item.text || "", playtime_ms: item.voice_item.playtime });
-    } else if (type === ITEM.TEXT) {
-      items.push({ type: "text", text: piece });
+      items.push({ type: "voice", text: item.voice_item.text || "" });
     }
+    // Skip redundant type:text items — text field already carries content.
   }
+  if (downloads.length) await Promise.all(downloads);
   return {
     from_user_id: from,
     context_token: msg.context_token || "",
-    message_id: msg.message_id ?? msg.client_id ?? "",
     create_time_ms: msg.create_time_ms,
     text,
     items,
@@ -335,24 +344,39 @@ export async function normalizeInbound(msg) {
 }
 
 export async function collectInbound(rawMsgs, account) {
+  const candidates = (rawMsgs || []).filter((msg) => {
+    if (msg.message_type && msg.message_type !== MSG_TYPE.USER) return false;
+    if (msg.message_state && msg.message_state !== MSG_STATE.FINISH) return false;
+    return true;
+  });
+  const normalizedList = await Promise.all(candidates.map((msg) => normalizeInbound(msg)));
+  const contexts = [];
   const out = [];
-  for (const msg of rawMsgs || []) {
-    if (msg.message_type && msg.message_type !== MSG_TYPE.USER) continue;
-    if (msg.message_state && msg.message_state !== MSG_STATE.FINISH) continue;
-    const normalized = await normalizeInbound(msg);
+  for (const normalized of normalizedList) {
     if (!normalized.from_user_id) continue;
-    updateState((s) => {
-      const hit = findAccount(s, { token: account.token });
-      if (hit) rememberContext(s, hit, normalized.from_user_id, normalized.context_token);
-      return s;
-    });
+    if (normalized.context_token) {
+      contexts.push([normalized.from_user_id, normalized.context_token]);
+    }
     out.push({
-      ...normalized,
+      from_user_id: normalized.from_user_id,
+      context_token: normalized.context_token,
+      create_time_ms: normalized.create_time_ms,
+      text: normalized.text,
+      items: normalized.items,
       ilink_bot_id: account.ilinkBotId,
       ilink_user_id: account.ilinkUserId,
       dedicated_assistant_id: account.dedicatedAssistant?.id || "",
       dedicated_assistant_name: account.dedicatedAssistant?.name || "",
       session_id: `${account.ilinkBotId || ""}::${normalized.from_user_id}`,
+    });
+  }
+  if (contexts.length) {
+    updateState((s) => {
+      const hit = findAccount(s, { token: account.token });
+      if (hit) {
+        for (const [uid, token] of contexts) rememberContext(s, hit, uid, token);
+      }
+      return s;
     });
   }
   return { messages: out, logged_in_user: account.ilinkUserId };
@@ -388,10 +412,8 @@ async function sendItem(account, to, item, contextToken) {
     throw new Error(`发送失败 ret=${resp.ret} ${resp.errmsg || ""}`);
   }
   return {
-    to_user_id: to,
-    ilink_bot_id: account.ilinkBotId,
-    ilink_user_id: account.ilinkUserId,
-    context_token: token || "",
+    to: to,
+    bot: account.ilinkBotId,
     ret: resp.ret ?? 0,
   };
 }
@@ -418,11 +440,8 @@ export async function sendText(toUserId, text, ilinkBotId) {
     role: "assistant",
     text: plain,
   });
-  try {
-    await setTyping(to, false, account.ilinkBotId);
-  } catch {
-    // typing off is best-effort
-  }
+  // Don't block send return on typing-off RTT.
+  void setTyping(to, false, account.ilinkBotId).catch(() => {});
   return last;
 }
 
@@ -504,13 +523,8 @@ export async function sendMedia(toUserId, filePath, kind, caption, ilinkBotId) {
     from_user_id: to,
     role: "assistant",
     text: caption || `[${kind}] ${path.basename(filePath)}`,
-    items: [{ type: kind, path: filePath }],
   });
-  try {
-    await setTyping(to, false, account.ilinkBotId);
-  } catch {
-    // typing off is best-effort
-  }
+  void setTyping(to, false, account.ilinkBotId).catch(() => {});
   return last;
 }
 
@@ -526,7 +540,7 @@ export async function setTyping(toUserId, on, ilinkBotId) {
       "ilink/bot/getconfig",
       { ilink_user_id: to, context_token: contextFor(account, to) || undefined },
       account.token,
-      10_000,
+      5_000,
     );
     ticket = cfg.typing_ticket || "";
     if (ticket) {
@@ -543,9 +557,9 @@ export async function setTyping(toUserId, on, ilinkBotId) {
     "ilink/bot/sendtyping",
     { ilink_user_id: to, typing_ticket: ticket, status: on ? TYPING.ON : TYPING.OFF },
     account.token,
-    10_000,
+    5_000,
   );
-  return { to_user_id: to, ilink_bot_id: account.ilinkBotId, typing: !!on };
+  return { to, bot: account.ilinkBotId, typing: !!on };
 }
 
 export function statusPayload() {
@@ -553,33 +567,35 @@ export function statusPayload() {
   const accounts = listAccounts(state);
   return {
     logged_in: accounts.length > 0,
-    account_count: accounts.length,
-    global_wake_configured: hasGlobalWake(),
+    n: accounts.length,
+    wake: hasGlobalWake(),
     accounts: accounts.map((a) => ({
-      ...accountSummary(a),
-      peers: Object.keys(a.contextTokens || {}),
+      bot: a.ilinkBotId,
+      asst: a.dedicatedAssistant?.name || "",
+      peers: Object.keys(a.contextTokens || {}).length,
     })),
-    pending_qr_count: state.pendingQrs.length,
-    allow_from: state.allowFrom,
     inbox: peekInboxCount(),
   };
 }
 
 export async function probeWake(url, key) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      source: "grok-wechat",
-      probe: true,
-      count: 0,
-    }),
-  });
-  const text = await res.text();
-  return { status: res.status, body: text.slice(0, 180) };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ src: "grok-wechat", probe: true }),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    return { status: res.status, body: text.slice(0, 80) };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function setAccountWake(ilink_bot_id, url, key) {
@@ -594,18 +610,12 @@ export async function setAccountWake(ilink_bot_id, url, key) {
     });
   }
   saveStateSecure(loadState());
-  return {
-    global_wake_configured: true,
-    ilink_bot_id: ilink_bot_id || null,
-    probe,
-    accounts: listAccounts(loadState()).map(accountSummary),
-  };
+  return { wake: true, probe };
 }
 
 export function setDedicatedAssistant(ilink_bot_id, assistant_id, assistant_name) {
   if (!ilink_bot_id) throw new Error("ilink_bot_id 必填");
   if (!assistant_name) throw new Error("assistant_name 必填");
-  // One dedicated Grok assistant per WeChat account; talks for that account stay in its session via history.
   updateState((s) => {
     const hit = requireAccount(s, { ilink_bot_id });
     hit.dedicatedAssistant = {
@@ -615,9 +625,5 @@ export function setDedicatedAssistant(ilink_bot_id, assistant_id, assistant_name
     return s;
   });
   saveStateSecure(loadState());
-  const account = findAccount(loadState(), { ilink_bot_id });
-  return {
-    ...accountSummary(account),
-    per_account_session: true,
-  };
+  return { bot: ilink_bot_id, asst: assistant_name, asst_id: assistant_id || "" };
 }

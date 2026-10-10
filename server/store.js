@@ -45,7 +45,10 @@ export function emptyState() {
   };
 }
 
-const MAX_TALK_TURNS = 80;
+const MAX_TALK_TURNS = 24;
+const HISTORY_TEXT_MAX = 400;
+/** Agent-facing history turns (keeps MCP/tool tokens small). */
+export const HISTORY_RETURN_TURNS = 8;
 
 export function talkKey(ilinkBotId, fromUserId) {
   return `${ilinkBotId || ""}::${fromUserId || ""}`;
@@ -71,7 +74,7 @@ function saveTalks(talks) {
   ensureHome();
   const file = talksPath();
   const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(talks, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(talks));
   fs.renameSync(tmp, file);
   try {
     fs.chmodSync(file, 0o600);
@@ -80,20 +83,24 @@ function saveTalks(talks) {
   }
 }
 
+function clipText(text, max = HISTORY_TEXT_MAX) {
+  const s = String(text || "");
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
 /**
  * Append a turn to the per-account Grok-session talk log for a WeChat peer.
  * role: "user" | "assistant"
  */
-export function appendTalk({ ilink_bot_id, from_user_id, role, text, items, at } = {}) {
+export function appendTalk({ ilink_bot_id, from_user_id, role, text, at } = {}) {
   if (!from_user_id || !role) return [];
   const key = talkKey(ilink_bot_id, from_user_id);
   const talks = loadTalks();
   const entry = {
     role,
-    text: String(text || "").slice(0, 8000),
+    text: clipText(text, 1200),
     at: at || Date.now(),
   };
-  if (items?.length) entry.items = items;
   const list = Array.isArray(talks[key]) ? talks[key] : [];
   list.push(entry);
   talks[key] = list.slice(-MAX_TALK_TURNS);
@@ -101,11 +108,27 @@ export function appendTalk({ ilink_bot_id, from_user_id, role, text, items, at }
   return talks[key];
 }
 
-export function getTalkHistory(ilink_bot_id, from_user_id, limit = 40) {
+/** Compact `{r,t}` turns for agent context (token-cheap). */
+export function getTalkHistory(ilink_bot_id, from_user_id, limit = HISTORY_RETURN_TURNS) {
   if (!from_user_id) return [];
   const list = loadTalks()[talkKey(ilink_bot_id, from_user_id)] || [];
-  const n = Math.max(1, Math.min(Number(limit) || 40, MAX_TALK_TURNS));
-  return list.slice(-n);
+  const n = Math.max(1, Math.min(Number(limit) || HISTORY_RETURN_TURNS, MAX_TALK_TURNS));
+  return list.slice(-n).map((e) => ({
+    r: e.role === "assistant" ? "a" : "u",
+    t: clipText(e.text, HISTORY_TEXT_MAX),
+  }));
+}
+
+/** Drop empty keys so tool JSON stays small. */
+export function slim(obj) {
+  if (obj == null || typeof obj !== "object" || Array.isArray(obj)) return obj;
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v == null || v === "") continue;
+    if (Array.isArray(v) && v.length === 0) continue;
+    out[k] = v;
+  }
+  return out;
 }
 
 /** Dedicated Grok assistant for one bound WeChat account (one assistant per account). */
@@ -300,16 +323,20 @@ export function drainInbox() {
     .filter(Boolean)
     .map((msg) => {
       const dedicated = getAccountAssistant(state, msg.ilink_bot_id);
-      return {
-        ...msg,
-        session_id: msg.session_id || talkKey(msg.ilink_bot_id, msg.from_user_id),
-        dedicated_assistant_id: dedicated?.id || msg.dedicated_assistant_id || "",
-        dedicated_assistant_name: dedicated?.name || msg.dedicated_assistant_name || "",
-        // Prefer history stamped before the current turn was recorded.
-        history: Array.isArray(msg.history)
+      // Omit context_token (server-side only) and empty noise to save agent tokens.
+      const media = (msg.items || []).filter((it) => it && it.type !== "text" && (it.path || it.text));
+      return slim({
+        from: msg.from_user_id,
+        bot: msg.ilink_bot_id,
+        text: msg.text || undefined,
+        media: media.length ? media.map((it) => slim({ type: it.type, path: it.path, name: it.name, text: it.text })) : undefined,
+        sid: msg.session_id || talkKey(msg.ilink_bot_id, msg.from_user_id),
+        asst: dedicated?.name || msg.dedicated_assistant_name || undefined,
+        asst_id: dedicated?.id || msg.dedicated_assistant_id || undefined,
+        hist: Array.isArray(msg.history)
           ? msg.history
           : getTalkHistory(msg.ilink_bot_id, msg.from_user_id),
-      };
+      });
     });
 }
 
