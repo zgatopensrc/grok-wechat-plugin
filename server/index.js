@@ -340,7 +340,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.10.0" },
+        serverInfo: { name: "grok-wechat", version: "1.11.0" },
       },
     };
   }
@@ -411,19 +411,22 @@ function startMcp() {
 // bursts into one wake, typing keepalive, and wake retry.
 // ---------------------------------------------------------------------------
 
-const DEFAULT_COALESCE_MS = 3000;
+// Burst merging: wake once no new message has arrived for IDLE ms, but never later than
+// CAP ms after the first message of the burst. A lone message therefore waits ~IDLE, not CAP.
+const DEFAULT_COALESCE_MS = 3000; // CAP (GROK_WECHAT_COALESCE_MS)
+const DEFAULT_COALESCE_IDLE_MS = 1000; // GROK_WECHAT_COALESCE_IDLE_MS
 
 /** Non-negative integer milliseconds. Unset, blank, or invalid values use the default. */
-function readCoalesceMs(raw = process.env.GROK_WECHAT_COALESCE_MS) {
-  if (raw == null) return DEFAULT_COALESCE_MS;
+function readMs(raw, dflt) {
+  if (raw == null) return dflt;
   const text = String(raw).trim();
-  if (!/^\d+$/.test(text)) return DEFAULT_COALESCE_MS;
+  if (!/^\d+$/.test(text)) return dflt;
   const n = Number(text);
-  if (!Number.isSafeInteger(n)) return DEFAULT_COALESCE_MS;
-  return n;
+  return Number.isSafeInteger(n) ? n : dflt;
 }
 
-const COALESCE_MS = readCoalesceMs();
+const COALESCE_MS = readMs(process.env.GROK_WECHAT_COALESCE_MS, DEFAULT_COALESCE_MS);
+const COALESCE_IDLE_MS = Math.min(readMs(process.env.GROK_WECHAT_COALESCE_IDLE_MS, DEFAULT_COALESCE_IDLE_MS), COALESCE_MS);
 const WAKE_TIMEOUT_MS = 12_000;
 const WAKE_ATTEMPT_DELAYS_MS = [0, 800, 2_500];
 // Background retries (after the quick attempts failed): sooner at first, then every 30s.
@@ -727,11 +730,14 @@ function enqueue(botId, messages, log) {
   startTyping(fresh, log);
   let slot = pending.get(botId);
   if (!slot) {
-    slot = { msgs: [], timer: null };
+    slot = { msgs: [], timer: null, first: Date.now() };
     pending.set(botId, slot);
   }
   slot.msgs.push(...fresh);
-  if (!slot.timer) slot.timer = setTimeout(() => { flush(botId, log).catch((err) => log(`flush error ${errText(err)}`)); }, COALESCE_MS);
+  // Restart the quiet timer on every message, bounded by the cap measured from the first one.
+  if (slot.timer) clearTimeout(slot.timer);
+  const wait = Math.max(0, Math.min(COALESCE_IDLE_MS, slot.first + COALESCE_MS - Date.now()));
+  slot.timer = setTimeout(() => { flush(botId, log).catch((err) => log(`flush error ${errText(err)}`)); }, wait);
 }
 
 // --- polling -------------------------------------------------------------------

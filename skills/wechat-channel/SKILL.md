@@ -6,7 +6,7 @@ description: 安装/登录/收发/卸载微信 iLink。每号一专属助手；�
 
 MCP `grok-wechat` → iLink。
 
-`私信 → monitor(立即 typing，保活至回复) → 默认 3000ms 合并连发（GROK_WECHAT_COALESCE_MS） → webhook(msgs[+hist 首次]) → 转交该号专属助手 → 助手回复 wechat_send → wechat_ack`
+`私信 → monitor(立即 typing，保活至回复) → 连发合并（安静 1s 即唤醒，最晚首条后 3s；GROK_WECHAT_COALESCE_IDLE_MS / GROK_WECHAT_COALESCE_MS） → webhook(msgs[+hist 首次]) → 转交该号专属助手 → 助手回复 wechat_send → wechat_ack`
 
 立刻回复。typing 由 monitor 自动开启并每 5s 保活，`wechat_send` 后自动关闭，**无需**再调 `wechat_typing`。
 
