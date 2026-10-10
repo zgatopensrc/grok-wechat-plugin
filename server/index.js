@@ -169,7 +169,7 @@ const tools = {
     },
   },
   wechat_inbox: {
-    description: "Peek inbox (does NOT clear). Returns msgs[{id,from,bot,text,media,sid,asst}] + hist{sid:[{r,t}]} (full history, once per conversation). Prefer the wake payload if present. After replying call wechat_ack.",
+    description: "Peek inbox (does NOT clear). Returns msgs[{id,from,bot,text,media,sid,asst}] + hist{sid:[{r,t}]} (full history, until the assistant's thread has it) + thread[sids] (history already in the assistant's thread, not resent). Prefer the wake payload if present. After replying call wechat_ack.",
     inputSchema: { type: "object", properties: {} },
     handle: async () => ok({ ...peekInbox(), ack: "wechat_ack" }),
   },
@@ -244,7 +244,7 @@ const tools = {
     handle: async ({ ilink_bot_id, url, key }) => ok(await setAccountWake(ilink_bot_id, url, key)),
   },
   wechat_set_dedicated_assistant: {
-    description: "Register per-account dedicated assistant.",
+    description: "Register per-account dedicated assistant. Re-registering resets sync: the next wake carries full history again.",
     inputSchema: {
       type: "object",
       properties: {
@@ -327,7 +327,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.6.2" },
+        serverInfo: { name: "grok-wechat", version: "1.7.0" },
       },
     };
   }

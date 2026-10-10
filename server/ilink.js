@@ -16,6 +16,7 @@ import {
   requireAccount,
   resolveAccountForPeer,
   saveGlobalWake,
+  resetSeeded,
   saveStateSecure,
   updateState,
   upsertAccount,
@@ -615,5 +616,6 @@ export function setDedicatedAssistant(ilink_bot_id, assistant_id, assistant_name
     return s;
   });
   saveStateSecure(loadState());
+  resetSeeded(ilink_bot_id); // (re)registering = fresh thread assumed: resend full history once
   return { bot: ilink_bot_id, asst: assistant_name, asst_id: assistant_id || "" };
 }

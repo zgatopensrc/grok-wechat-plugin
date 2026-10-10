@@ -467,12 +467,74 @@ export function formatAgentMsg(msg, state = loadState()) {
   });
 }
 
+// --- "seeded" tracking ----------------------------------------------------------
+// The account's dedicated assistant keeps one persistent thread, so once it has handled
+// a conversation (first batch acked) it already holds the full history and we stop
+// resending it. The full log stays on disk regardless (backup / re-seed source).
+// Stored in its own small file so it never contends with the monitor's state.json writes.
+function seededFile() {
+  return path.join(paths().home, "seeded.json");
+}
+
+function readSeeded() {
+  try {
+    return JSON.parse(fs.readFileSync(seededFile(), "utf8")) || {};
+  } catch {
+    return {};
+  }
+}
+
+function writeSeeded(map) {
+  ensureHome();
+  const file = seededFile();
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify(map));
+  fs.renameSync(`${file}.tmp`, file);
+}
+
+function assistantKey(state, ilink_bot_id) {
+  const a = getAccountAssistant(state, ilink_bot_id);
+  return a ? a.id || a.name : "";
+}
+
+/** Mark conversations as already present in their assistant's thread. */
+export function markSeeded(rows, state = loadState()) {
+  const map = readSeeded();
+  let changed = false;
+  for (const m of rows) {
+    const key = assistantKey(state, m.ilink_bot_id);
+    if (!key) continue; // no dedicated assistant registered: we can't know its thread has it
+    const sid = m.session_id || talkKey(m.ilink_bot_id, m.from_user_id);
+    if (map[sid] !== key) {
+      map[sid] = key;
+      changed = true;
+    }
+  }
+  if (changed) writeSeeded(map);
+}
+
+/** Forget seeding for one account: its next wake carries full history again. */
+export function resetSeeded(ilink_bot_id) {
+  const map = readSeeded();
+  const prefix = `${ilink_bot_id}::`;
+  let changed = false;
+  for (const sid of Object.keys(map)) {
+    if (sid.startsWith(prefix)) {
+      delete map[sid];
+      changed = true;
+    }
+  }
+  if (changed) writeSeeded(map);
+}
+
 /**
- * Agent payload: `msgs` plus full history ONCE per conversation (`hist[sid]`),
- * not repeated on every message. History covers turns before the earliest
- * message of that conversation in this batch, so nothing is duplicated or capped.
+ * Agent payload: `msgs`, plus for each conversation EITHER
+ *  - `hist[sid]`: the full uncapped history before this batch (sent until the account's
+ *    dedicated assistant has handled that conversation once), OR
+ *  - `thread` lists the sid: the assistant's own thread already holds the history, so it
+ *    is not resent.
  */
 export function packMsgs(rawMsgs, state = loadState()) {
+  const seeded = readSeeded();
   const firstBySid = new Map();
   const limitBySid = new Map();
   for (const m of rawMsgs) {
@@ -482,12 +544,24 @@ export function packMsgs(rawMsgs, state = loadState()) {
     limitBySid.set(sid, Math.min(limitBySid.get(sid) ?? Number.POSITIVE_INFINITY, n));
   }
   const hist = {};
+  const thread = [];
   for (const [sid, m] of firstBySid) {
+    const key = assistantKey(state, m.ilink_bot_id);
     const limit = limitBySid.get(sid);
+    const n = Number.isFinite(limit) ? limit : getTalkCount(m.ilink_bot_id, m.from_user_id);
+    if (n <= 0) continue; // brand-new conversation
+    if (key && seeded[sid] === key) {
+      thread.push(sid);
+      continue;
+    }
     const h = getTalkHistory(m.ilink_bot_id, m.from_user_id, Number.isFinite(limit) ? limit : undefined);
     if (h.length) hist[sid] = h;
   }
-  return slim({ msgs: rawMsgs.map((m) => formatAgentMsg(m, state)), hist: Object.keys(hist).length ? hist : undefined });
+  return slim({
+    msgs: rawMsgs.map((m) => formatAgentMsg(m, state)),
+    hist: Object.keys(hist).length ? hist : undefined,
+    thread: thread.length ? thread : undefined,
+  });
 }
 
 /** Append to inbox (locked). Returns the stored copies, each with a stable `id`. */
@@ -519,17 +593,23 @@ export function inboxByIds(ids) {
 
 /** Remove messages by id after successful handling. Omitting ids clears all. */
 export function ackInbox(ids) {
-  return withInboxLock(() => {
+  let dropped = [];
+  const result = withInboxLock(() => {
     const raw = readInboxRaw();
     if (!ids?.length) {
+      dropped = raw;
       writeInboxRaw([]);
       return { acked: raw.length, remaining: 0 };
     }
     const drop = new Set(ids.map(String));
     const kept = raw.filter((m) => !drop.has(String(m.id || "")));
+    dropped = raw.filter((m) => drop.has(String(m.id || "")));
     writeInboxRaw(kept);
     return { acked: raw.length - kept.length, remaining: kept.length };
   });
+  // Handled => the assistant's thread now holds these conversations.
+  if (dropped.length) markSeeded(dropped);
+  return result;
 }
 
 export function peekInboxCount() {
