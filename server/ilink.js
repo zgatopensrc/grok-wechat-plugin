@@ -6,7 +6,6 @@ import {
   contextFor,
   emptyAccount,
   findAccount,
-  hasAccountWake,
   hasGlobalWake,
   listAccounts,
   loadState,
@@ -105,17 +104,6 @@ export async function apiPost(baseUrl, endpoint, body, token, timeoutMs = API_TI
     timeoutMs,
   );
   return JSON.parse(text);
-}
-
-function accountSummary(account) {
-  return {
-    ilink_bot_id: account.ilinkBotId,
-    ilink_user_id: account.ilinkUserId,
-    logged_in: Boolean(account.token),
-    has_wake: hasAccountWake(account),
-    dedicated_assistant_id: account.dedicatedAssistant?.id || "",
-    dedicated_assistant_name: account.dedicatedAssistant?.name || "",
-  };
 }
 
 function applyLoginConfirm(state, last) {
