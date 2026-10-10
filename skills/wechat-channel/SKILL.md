@@ -15,11 +15,22 @@ MCP `grok-wechat` → iLink。
 用户：「安装这个微信插件 https://github.com/little-thing/grok-wechat-plugin」
 
 1. 加连接器 `grok-wechat`（`server/index.js`）
-2. Routine「微信入站唤醒」(webhook，全局一条)：直接用 payload（无需 `wechat_inbox`）；**把 payload 原样转交给 `bot` 对应的专属助手 `asst`（同一个持久会话，不要新开）**，由它回复；它回复后再 `wechat_ack`。`asst` 为空则自己直接回复
+2. Routine「微信入站唤醒」(webhook，全局一条)：prompt 用下面「分发 Routine 的 prompt」原文，**不要加别的**
 3. Routine「微信监听保活」每 **20 分钟**：只调 `wechat_start_monitor`
 4. 用户粘贴 webhook url+key → `wechat_set_wake`（不带 `ilink_bot_id` = 全局）
 5. `wechat_login_start` → 立刻 `wechat_login_wait` 至 `logged_in`
 6. 每号：建专属助手 → `wechat_set_dedicated_assistant`
+
+### 分发 Routine 的 prompt（最简，原文使用）
+
+```
+把收到的 webhook payload 原样转交给专属助手 `asst`（同一个持久会话，不要新开），然后结束。
+`asst` 为空：自己直接处理——按 payload 的 msgs（和 hist）回复，wechat_send 之后 wechat_ack。
+```
+
+- **不要**做身份判断（payload 里的 `asst` 已指明目标，不用自己核对 bot/助手名）
+- **不要**等待助手回复，**不要**设超时兜底、不要替助手回复已转交的消息：转交即结束；回复和 `wechat_ack` 都由专属助手自己做（payload 里带着 `ack` 和各消息 `id`）
+- 专属助手不回复/被删由插件在服务端兜底：连续 3 次唤醒 2 分钟无回复（或 5 分钟无回复）→ 自动清掉登记，之后 payload 的 `asst` 为空、由分发 Routine 直接处理
 
 ### 可选：每号 webhook 直达（省掉转交这一手）
 
@@ -55,7 +66,7 @@ MCP `grok-wechat` → iLink。
 
 ## 流程
 
-1. 用 `msgs`（+`hist`，若有）理解并回复（转交方式下由专属助手回复）（webhook 缺失/失败时 `wechat_inbox`，它**只 peek 不清空**）
+1. 用 `msgs`（+`hist`，若有）理解并回复（转交方式下由专属助手回复，分发 Routine 不参与）（webhook 缺失/失败时 `wechat_inbox`，它**只 peek 不清空**）
 2. `wechat_send`（`to_user_id=from`，带同一 `bot`）
 3. **`wechat_ack`（`ids` = msgs 的 id）**，须在 `wechat_send` 之后：只有 ack 时插件已记录到晚于该消息的回复，才视为该会话已同步到助手会话；提前 ack 会在返回里列出 `unsynced`，其历史下次唤醒会重发。未 ack 的消息保留；webhook 失败时 monitor 会自动重试唤醒（最多 6 次，间隔 30s）
 
