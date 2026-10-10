@@ -201,51 +201,6 @@ export function getTalkHistory(ilink_bot_id, from_user_id, upTo) {
   return list.map((e) => ({ r: e.role === "assistant" ? "a" : "u", t: e.text || "" }));
 }
 
-const clampInt = (v, lo, hi, dflt) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.trunc(n))) : dflt;
-};
-
-/**
- * Verbatim, pageable, searchable access to the FULL talk log. Turns are never
- * truncated or summarized; `limit` only sets the page size, and `before` pages back
- * through everything. `i` is the absolute turn index (same as the position in the
- * wake payload's `hist[sid]`).
- *
- *  - no query: the `limit` turns just before `before` (default: the end)
- *  - query:    the `limit` most recent turns containing `query` (case-insensitive),
- *              each with `context` turns of surrounding conversation
- */
-export function queryTalk(ilink_bot_id, from_user_id, { before, limit, query, context } = {}) {
-  const key = talkKey(ilink_bot_id, from_user_id);
-  const file = talkFile(key);
-  migrateLegacyTalk(key, file);
-  const all = readTalkEntries(file).map((e, i) => ({ i, r: e.role === "assistant" ? "a" : "u", t: e.text || "" }));
-  const total = all.length;
-  const lim = clampInt(limit, 1, 500, 40);
-  const end = before == null || before === "" ? total : clampInt(before, 0, total, total);
-  const pool = all.slice(0, end);
-
-  const q = query == null ? "" : String(query).trim().toLowerCase();
-  if (q) {
-    const hits = pool.filter((e) => e.t.toLowerCase().includes(q)).map((e) => e.i);
-    const recent = hits.slice(-lim);
-    const ctx = clampInt(context, 0, 10, 0);
-    const want = new Set();
-    for (const i of recent) {
-      for (let k = Math.max(0, i - ctx); k <= Math.min(end - 1, i + ctx); k++) want.add(k);
-    }
-    return {
-      total,
-      matches: hits.length,
-      turns: [...want].sort((a, b) => a - b).map((i) => all[i]),
-      more: hits.length > recent.length,
-    };
-  }
-  const turns = pool.slice(-lim);
-  return { total, turns, more: turns.length > 0 && turns[0].i > 0 };
-}
-
 export function getTalkCount(ilink_bot_id, from_user_id) {
   const key = talkKey(ilink_bot_id, from_user_id);
   const file = talkFile(key);
@@ -512,42 +467,27 @@ export function formatAgentMsg(msg, state = loadState()) {
   });
 }
 
-// Recent-context floor embedded in each payload so short follow-ups ("好的", "继续")
-// work even if the agent never calls wechat_history. Display-only: storage is untouched.
-const TAIL_TURNS = 6;
-const TAIL_CHARS = 500;
-
 /**
- * Agent payload: `msgs`, `prior[sid]` (turn count before this batch) and `recent[sid]`
- * (the last few turns before the batch, `{i,r,t}`; `x` = original length when `t` was
- * shortened for display). Everything older, or any shortened turn, is fetched verbatim
- * via `wechat_history`. Nothing is dropped from storage.
+ * Agent payload: `msgs` plus full history ONCE per conversation (`hist[sid]`),
+ * not repeated on every message. History covers turns before the earliest
+ * message of that conversation in this batch, so nothing is duplicated or capped.
  */
 export function packMsgs(rawMsgs, state = loadState()) {
-  const bySid = new Map(); // sid -> { bot, from, n }
+  const firstBySid = new Map();
+  const limitBySid = new Map();
   for (const m of rawMsgs) {
     const sid = m.session_id || talkKey(m.ilink_bot_id, m.from_user_id);
-    const n = typeof m.hist_n === "number" ? m.hist_n : getTalkCount(m.ilink_bot_id, m.from_user_id);
-    const cur = bySid.get(sid);
-    bySid.set(sid, { bot: m.ilink_bot_id, from: m.from_user_id, n: cur ? Math.min(cur.n, n) : n });
+    if (!firstBySid.has(sid)) firstBySid.set(sid, m);
+    const n = typeof m.hist_n === "number" ? m.hist_n : Number.POSITIVE_INFINITY;
+    limitBySid.set(sid, Math.min(limitBySid.get(sid) ?? Number.POSITIVE_INFINITY, n));
   }
-  const prior = {};
-  const recent = {};
-  for (const [sid, { bot, from, n }] of bySid) {
-    if (n <= 0) continue;
-    prior[sid] = n;
-    const { turns } = queryTalk(bot, from, { before: n, limit: TAIL_TURNS });
-    if (turns.length) {
-      recent[sid] = turns.map((t) =>
-        t.t.length > TAIL_CHARS ? { i: t.i, r: t.r, t: `${t.t.slice(0, TAIL_CHARS)}…`, x: t.t.length } : t,
-      );
-    }
+  const hist = {};
+  for (const [sid, m] of firstBySid) {
+    const limit = limitBySid.get(sid);
+    const h = getTalkHistory(m.ilink_bot_id, m.from_user_id, Number.isFinite(limit) ? limit : undefined);
+    if (h.length) hist[sid] = h;
   }
-  return slim({
-    msgs: rawMsgs.map((m) => formatAgentMsg(m, state)),
-    prior: Object.keys(prior).length ? prior : undefined,
-    recent: Object.keys(recent).length ? recent : undefined,
-  });
+  return slim({ msgs: rawMsgs.map((m) => formatAgentMsg(m, state)), hist: Object.keys(hist).length ? hist : undefined });
 }
 
 /** Append to inbox (locked). Returns the stored copies, each with a stable `id`. */
