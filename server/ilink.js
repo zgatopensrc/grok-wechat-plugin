@@ -325,6 +325,7 @@ export async function normalizeInbound(msg) {
   return {
     from_user_id: from,
     context_token: msg.context_token || "",
+    message_id: String(msg.message_id ?? msg.client_id ?? ""),
     create_time_ms: msg.create_time_ms,
     text,
     items,
@@ -348,6 +349,7 @@ export async function collectInbound(rawMsgs, account) {
     out.push({
       from_user_id: normalized.from_user_id,
       context_token: normalized.context_token,
+      message_id: normalized.message_id,
       create_time_ms: normalized.create_time_ms,
       text: normalized.text,
       items: normalized.items,

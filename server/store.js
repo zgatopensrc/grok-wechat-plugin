@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -49,28 +50,24 @@ export function talkKey(ilinkBotId, fromUserId) {
   return `${ilinkBotId || ""}::${fromUserId || ""}`;
 }
 
-function talksPath() {
+function talksDir() {
+  return path.join(homeDir(), "talks");
+}
+
+function legacyTalksPath() {
   return path.join(homeDir(), "talks.json");
 }
 
-export function loadTalks() {
-  ensureHome();
-  const file = talksPath();
-  if (!fs.existsSync(file)) return {};
-  try {
-    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
-    return raw && typeof raw === "object" ? raw : {};
-  } catch {
-    return {};
-  }
+function talkFile(key) {
+  const id = crypto.createHash("sha1").update(key).digest("hex").slice(0, 20);
+  return path.join(talksDir(), `${id}.jsonl`);
 }
 
-function saveTalks(talks) {
-  ensureHome();
-  const file = talksPath();
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(talks));
-  fs.renameSync(tmp, file);
+function metaFile(file) {
+  return `${file}.meta.json`;
+}
+
+function chmodQuiet(file) {
   try {
     fs.chmodSync(file, 0o600);
   } catch {
@@ -78,70 +75,143 @@ function saveTalks(talks) {
   }
 }
 
+/** One-time lazy import from the old single-file talks.json. */
+function migrateLegacyTalk(key, file) {
+  if (fs.existsSync(file)) return;
+  const legacy = legacyTalksPath();
+  if (!fs.existsSync(legacy)) return;
+  try {
+    const raw = JSON.parse(fs.readFileSync(legacy, "utf8"));
+    const list = raw?.[key];
+    if (!Array.isArray(list) || !list.length) return;
+    fs.mkdirSync(talksDir(), { recursive: true });
+    fs.writeFileSync(file, `${list.map((e) => JSON.stringify({ role: e.role, text: e.text || "", at: e.at || 0 })).join("\n")}\n`);
+    chmodQuiet(file);
+  } catch {
+    // ignore
+  }
+}
+
+function readTalkEntries(file) {
+  if (!fs.existsSync(file)) return [];
+  const out = [];
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    if (!line) continue;
+    try {
+      out.push(JSON.parse(line));
+    } catch {
+      // skip corrupt line
+    }
+  }
+  return out;
+}
+
+function loadMeta(file) {
+  const mf = metaFile(file);
+  if (fs.existsSync(mf)) {
+    try {
+      return JSON.parse(fs.readFileSync(mf, "utf8"));
+    } catch {
+      // rebuild below
+    }
+  }
+  const entries = readTalkEntries(file);
+  const meta = { n: entries.length, last: entries.at(-1) || null, lastAssistantAt: 0, lastUserAt: 0 };
+  for (const e of entries) {
+    if (e.role === "assistant") meta.lastAssistantAt = Math.max(meta.lastAssistantAt, e.at || 0);
+    else meta.lastUserAt = Math.max(meta.lastUserAt, e.at || 0);
+  }
+  return meta;
+}
+
+function saveMeta(file, meta) {
+  const mf = metaFile(file);
+  fs.writeFileSync(mf, JSON.stringify(meta));
+  chmodQuiet(mf);
+}
+
 function normTalkText(text) {
   return String(text || "").replace(/\s+/g, " ").trim();
 }
 
-/** True when next turn is a duplicate/merge of prev (text+media double-log, etc.). */
+function stripMediaPrefix(s) {
+  const m = s.match(/^\[(image|video|file|voice)\]\s*(.*)$/i);
+  return m ? normTalkText(m[2]) : s;
+}
+
+const DUP_WINDOW_MS = 120_000;
+
+/**
+ * Assistant-only: the same reply is often logged twice (text, then text+media).
+ * User turns are never merged — a repeated "好的" is a real message.
+ */
 function isDuplicateTalk(prev, next) {
-  if (!prev || prev.role !== next.role) return false;
-  const a = normTalkText(prev.text);
-  const b = normTalkText(next.text);
-  if (!a && !b) return true;
-  if (a === b) return true;
-  const stripMedia = (s) => {
-    const m = s.match(/^\[(image|video|file|voice)\]\s*(.*)$/i);
-    return m ? normTalkText(m[2]) : s;
-  };
-  const aCore = stripMedia(a);
-  const bCore = stripMedia(b);
-  // text then "[image] text", or reverse; same caption/body
-  if (aCore && bCore && (aCore === bCore || aCore.startsWith(bCore) || bCore.startsWith(aCore))) {
-    return true;
-  }
-  if (a && b && (a.startsWith(b) || b.startsWith(a))) return true;
-  return false;
+  if (!prev || prev.role !== "assistant" || next.role !== "assistant") return false;
+  if (Math.abs((next.at || 0) - (prev.at || 0)) > DUP_WINDOW_MS) return false;
+  const a = stripMediaPrefix(normTalkText(prev.text));
+  const b = stripMediaPrefix(normTalkText(next.text));
+  return Boolean(a) && a === b;
+}
+
+function replaceLastLine(file, entry) {
+  const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean);
+  lines[lines.length - 1] = JSON.stringify(entry);
+  fs.writeFileSync(file, `${lines.join("\n")}\n`);
 }
 
 /**
- * Append a turn to the per-account talk log. History is not capped.
- * Dedupes consecutive same-role duplicates (e.g. text + media of same reply).
+ * Append a turn to the per-peer talk log (append-only JSONL, one file per peer).
+ * History is NOT capped. Consecutive duplicate assistant turns are merged.
  */
 export function appendTalk({ ilink_bot_id, from_user_id, role, text, at } = {}) {
-  if (!from_user_id || !role) return [];
+  if (!from_user_id || !role) return;
   const key = talkKey(ilink_bot_id, from_user_id);
-  const talks = loadTalks();
-  const entry = {
-    role,
-    text: String(text || ""),
-    at: at || Date.now(),
-  };
-  const list = Array.isArray(talks[key]) ? talks[key] : [];
-  const prev = list[list.length - 1];
-  if (isDuplicateTalk(prev, entry)) {
-    // Keep the richer text; bump timestamp.
-    if (normTalkText(entry.text).length > normTalkText(prev.text).length) {
-      prev.text = entry.text;
-    }
-    prev.at = entry.at;
-    talks[key] = list;
-    saveTalks(talks);
-    return list;
+  const file = talkFile(key);
+  fs.mkdirSync(talksDir(), { recursive: true });
+  migrateLegacyTalk(key, file);
+  const meta = loadMeta(file);
+  const entry = { role, text: String(text || ""), at: at || Date.now() };
+  if (isDuplicateTalk(meta.last, entry)) {
+    const merged = {
+      ...meta.last,
+      text: normTalkText(entry.text).length > normTalkText(meta.last.text).length ? entry.text : meta.last.text,
+      at: entry.at,
+    };
+    replaceLastLine(file, merged);
+    meta.last = merged;
+  } else {
+    fs.appendFileSync(file, `${JSON.stringify(entry)}\n`);
+    chmodQuiet(file);
+    meta.last = entry;
+    meta.n = (meta.n || 0) + 1;
   }
-  list.push(entry);
-  talks[key] = list;
-  saveTalks(talks);
-  return list;
+  if (role === "assistant") meta.lastAssistantAt = entry.at;
+  else meta.lastUserAt = entry.at;
+  saveMeta(file, meta);
 }
 
-/** Full history for a peer — no turn/text cap. Compact keys `{r,t}` only. */
-export function getTalkHistory(ilink_bot_id, from_user_id) {
+/** Full history for a peer (optionally the first `upTo` turns). No cap. Compact `{r,t}`. */
+export function getTalkHistory(ilink_bot_id, from_user_id, upTo) {
   if (!from_user_id) return [];
-  const list = loadTalks()[talkKey(ilink_bot_id, from_user_id)] || [];
-  return list.map((e) => ({
-    r: e.role === "assistant" ? "a" : "u",
-    t: e.text || "",
-  }));
+  const key = talkKey(ilink_bot_id, from_user_id);
+  const file = talkFile(key);
+  migrateLegacyTalk(key, file);
+  let list = readTalkEntries(file);
+  if (typeof upTo === "number" && Number.isFinite(upTo)) list = list.slice(0, upTo);
+  return list.map((e) => ({ r: e.role === "assistant" ? "a" : "u", t: e.text || "" }));
+}
+
+export function getTalkCount(ilink_bot_id, from_user_id) {
+  const key = talkKey(ilink_bot_id, from_user_id);
+  const file = talkFile(key);
+  migrateLegacyTalk(key, file);
+  return fs.existsSync(file) ? loadMeta(file).n || 0 : 0;
+}
+
+/** Timestamp of the last assistant turn for a peer (0 if none). */
+export function lastAssistantAt(ilink_bot_id, from_user_id) {
+  const file = talkFile(talkKey(ilink_bot_id, from_user_id));
+  return fs.existsSync(file) ? loadMeta(file).lastAssistantAt || 0 : 0;
 }
 
 /** Drop empty keys so tool JSON stays small. */
@@ -320,6 +390,42 @@ export function isAllowed(state, userId) {
   return state.allowFrom.includes(userId);
 }
 
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Cross-process lock for inbox read-modify-write. The monitor appends while the MCP
+ * process acks; without this an ack could silently drop a message that just arrived.
+ */
+function withInboxLock(fn) {
+  ensureHome();
+  const lock = `${paths().inbox}.lock`;
+  const deadline = Date.now() + 3_000;
+  let fd = -1;
+  while (fd < 0) {
+    try {
+      fd = fs.openSync(lock, "wx");
+    } catch {
+      try {
+        if (Date.now() - fs.statSync(lock).mtimeMs > 5_000) fs.unlinkSync(lock);
+      } catch {
+        // lock vanished — retry
+      }
+      if (Date.now() > deadline) break; // proceed unlocked rather than lose the message
+      sleepSync(10);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (fd >= 0) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+      try { fs.unlinkSync(lock); } catch { /* ignore */ }
+    }
+  }
+}
+
 function readInboxRaw() {
   const { inbox } = paths();
   if (!fs.existsSync(inbox)) return [];
@@ -341,14 +447,10 @@ function readInboxRaw() {
 function writeInboxRaw(messages) {
   ensureHome();
   const { inbox } = paths();
-  if (!messages.length) {
-    fs.writeFileSync(inbox, "");
-    return;
-  }
-  fs.writeFileSync(inbox, `${messages.map((m) => JSON.stringify(m)).join("\n")}\n`);
+  fs.writeFileSync(inbox, messages.length ? `${messages.map((m) => JSON.stringify(m)).join("\n")}\n` : "");
 }
 
-/** Agent-facing message shape (shared by inbox peek and wake webhook). */
+/** One message in agent-facing shape. History is NOT included here (see packMsgs). */
 export function formatAgentMsg(msg, state = loadState()) {
   const dedicated = getAccountAssistant(state, msg.ilink_bot_id);
   const media = (msg.items || []).filter((it) => it && it.type !== "text" && (it.path || it.text));
@@ -362,50 +464,72 @@ export function formatAgentMsg(msg, state = loadState()) {
       : undefined,
     sid: msg.session_id || talkKey(msg.ilink_bot_id, msg.from_user_id),
     asst: dedicated?.name || msg.dedicated_assistant_name || undefined,
-    asst_id: dedicated?.id || msg.dedicated_assistant_id || undefined,
-    hist: Array.isArray(msg.history)
-      ? msg.history
-      : getTalkHistory(msg.ilink_bot_id, msg.from_user_id),
   });
 }
 
+/**
+ * Agent payload: `msgs` plus full history ONCE per conversation (`hist[sid]`),
+ * not repeated on every message. History covers turns before the earliest
+ * message of that conversation in this batch, so nothing is duplicated or capped.
+ */
+export function packMsgs(rawMsgs, state = loadState()) {
+  const firstBySid = new Map();
+  const limitBySid = new Map();
+  for (const m of rawMsgs) {
+    const sid = m.session_id || talkKey(m.ilink_bot_id, m.from_user_id);
+    if (!firstBySid.has(sid)) firstBySid.set(sid, m);
+    const n = typeof m.hist_n === "number" ? m.hist_n : Number.POSITIVE_INFINITY;
+    limitBySid.set(sid, Math.min(limitBySid.get(sid) ?? Number.POSITIVE_INFINITY, n));
+  }
+  const hist = {};
+  for (const [sid, m] of firstBySid) {
+    const limit = limitBySid.get(sid);
+    const h = getTalkHistory(m.ilink_bot_id, m.from_user_id, Number.isFinite(limit) ? limit : undefined);
+    if (h.length) hist[sid] = h;
+  }
+  return slim({ msgs: rawMsgs.map((m) => formatAgentMsg(m, state)), hist: Object.keys(hist).length ? hist : undefined });
+}
+
+/** Append to inbox (locked). Returns the stored copies, each with a stable `id`. */
 export function appendInbox(messages) {
-  if (!messages.length) return;
+  if (!messages.length) return [];
   ensureHome();
-  const stamped = messages.map((m, i) => ({
-    ...m,
-    id: m.id || `m-${Date.now().toString(36)}-${i}-${Math.random().toString(36).slice(2, 8)}`,
-  }));
+  const stamped = messages.map((m, i) => {
+    // context_token lives in account state; never duplicate it (or history) into the inbox.
+    const { context_token: _ct, history: _h, ...rest } = m;
+    return { ...rest, id: m.id || `m-${Date.now().toString(36)}-${i}-${Math.random().toString(36).slice(2, 8)}` };
+  });
   const { inbox } = paths();
-  const lines = stamped.map((m) => JSON.stringify(m)).join("\n") + "\n";
-  fs.appendFileSync(inbox, lines);
+  withInboxLock(() => {
+    fs.appendFileSync(inbox, `${stamped.map((m) => JSON.stringify(m)).join("\n")}\n`);
+  });
   return stamped;
 }
 
-/** Peek inbox without clearing — ack after successful reply. */
+/** Peek inbox without clearing — ack after a successful reply. */
 export function peekInbox() {
-  const state = loadState();
-  return readInboxRaw().map((msg) => formatAgentMsg(msg, state));
+  return packMsgs(readInboxRaw());
 }
 
-/** @deprecated use peekInbox + ackInbox */
-export function drainInbox() {
-  const msgs = peekInbox();
-  writeInboxRaw([]);
-  return msgs;
+/** Raw inbox entries by id (monitor wake retries). */
+export function inboxByIds(ids) {
+  const want = new Set(ids.map(String));
+  return readInboxRaw().filter((m) => want.has(String(m.id || "")));
 }
 
 /** Remove messages by id after successful handling. Omitting ids clears all. */
 export function ackInbox(ids) {
-  const raw = readInboxRaw();
-  if (!ids?.length) {
-    writeInboxRaw([]);
-    return { acked: raw.length, remaining: 0 };
-  }
-  const drop = new Set(ids.map(String));
-  const kept = raw.filter((m) => !drop.has(String(m.id || "")));
-  writeInboxRaw(kept);
-  return { acked: raw.length - kept.length, remaining: kept.length };
+  return withInboxLock(() => {
+    const raw = readInboxRaw();
+    if (!ids?.length) {
+      writeInboxRaw([]);
+      return { acked: raw.length, remaining: 0 };
+    }
+    const drop = new Set(ids.map(String));
+    const kept = raw.filter((m) => !drop.has(String(m.id || "")));
+    writeInboxRaw(kept);
+    return { acked: raw.length - kept.length, remaining: kept.length };
+  });
 }
 
 export function peekInboxCount() {

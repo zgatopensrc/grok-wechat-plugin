@@ -8,13 +8,15 @@ import {
   appendTalk,
   clearPid,
   findAccount,
-  formatAgentMsg,
   getAccountAssistant,
-  getTalkHistory,
+  getTalkCount,
+  inboxByIds,
   isAllowed,
+  lastAssistantAt,
   listAccounts,
   loadState,
   monitorRunning,
+  packMsgs,
   paths,
   peekInbox,
   removeAccount,
@@ -42,13 +44,16 @@ import { registerShutdownCleanup, touchConnectorActive, connectorAbandoned, runU
 
 const self = fileURLToPath(import.meta.url);
 
-try {
-  fs.mkdirSync("/workspace/.grok-wechat", { recursive: true });
-  fs.appendFileSync(
-    "/workspace/.grok-wechat/mcp-host.log",
-    `${new Date().toISOString()} spawn pid=${process.pid} argv=${JSON.stringify(process.argv)} cwd=${process.cwd()}\n`,
-  );
-} catch { /* ignore */ }
+// Per-RPC disk logging is sync I/O on the hot path; opt in with GROK_WECHAT_DEBUG=1.
+const DEBUG = process.env.GROK_WECHAT_DEBUG === "1";
+function dlog(line) {
+  if (!DEBUG) return;
+  try {
+    fs.mkdirSync("/workspace/.grok-wechat", { recursive: true });
+    fs.appendFileSync("/workspace/.grok-wechat/mcp-host.log", `${new Date().toISOString()} ${line}\n`);
+  } catch { /* ignore */ }
+}
+dlog(`spawn pid=${process.pid} argv=${JSON.stringify(process.argv)} cwd=${process.cwd()}`);
 try {
   if (process.stdout._handle?.setBlocking) process.stdout._handle.setBlocking(true);
   if (process.stdin._handle?.setBlocking) process.stdin._handle.setBlocking(true);
@@ -164,9 +169,9 @@ const tools = {
     },
   },
   wechat_inbox: {
-    description: "Peek inbox (does NOT clear). Fields: id,from,bot,text,media,sid,asst,hist. Prefer wake.msgs if present. After reply call wechat_ack.",
+    description: "Peek inbox (does NOT clear). Returns msgs[{id,from,bot,text,media,sid,asst}] + hist{sid:[{r,t}]} (full history, once per conversation). Prefer the wake payload if present. After replying call wechat_ack.",
     inputSchema: { type: "object", properties: {} },
-    handle: async () => ok({ msgs: peekInbox(), ack: "wechat_ack" }),
+    handle: async () => ok({ ...peekInbox(), ack: "wechat_ack" }),
   },
   wechat_ack: {
     description: "Ack/remove inbox msgs after successful reply. Pass ids from msgs; omit ids to clear all.",
@@ -307,15 +312,11 @@ async function dispatch(name, args) {
 function writeMessage(msg) {
   const json = JSON.stringify(msg);
   fs.writeSync(1, json + "\n");
-  try {
-    fs.appendFileSync("/workspace/.grok-wechat/mcp-host.log", `${new Date().toISOString()} out ${json.slice(0, 200)}\n`);
-  } catch { /* ignore */ }
+  dlog(`out ${json.slice(0, 200)}`);
 }
 
 async function onRpc(msg) {
-  try {
-    fs.appendFileSync("/workspace/.grok-wechat/mcp-host.log", `${new Date().toISOString()} in ${JSON.stringify({id: msg.id, method: msg.method}).slice(0,300)}\n`);
-  } catch { /* ignore */ }
+  dlog(`in ${JSON.stringify({ id: msg.id, method: msg.method }).slice(0, 300)}`);
   const { id, method, params } = msg;
   if (method === "initialize") {
     touchConnectorActive();
@@ -326,7 +327,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.3.0" },
+        serverInfo: { name: "grok-wechat", version: "1.4.0" },
       },
     };
   }
@@ -392,34 +393,174 @@ function startMcp() {
 }
 
 
-async function startTypingForInbound(messages, log) {
-  const seen = new Set();
-  const jobs = [];
-  for (const m of messages) {
-    const peer = m.from_user_id;
-    const botId = m.ilink_bot_id || "";
-    if (!peer) continue;
-    const key = `${botId}::${peer}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    jobs.push(
-      setTyping(peer, true, botId || undefined)
-        .then(() => log(`typing on peer=${peer} bot=${botId}`))
-        .catch((err) => log(`typing error peer=${peer} ${err instanceof Error ? err.message : String(err)}`)),
-    );
-  }
-  await Promise.all(jobs);
+// ---------------------------------------------------------------------------
+// Monitor: one independent long-poll loop per account, a short debounce to merge
+// bursts into one wake, typing keepalive, and wake retry.
+// ---------------------------------------------------------------------------
+
+const COALESCE_MS = 600;
+const WAKE_TIMEOUT_MS = 12_000;
+const WAKE_ATTEMPT_DELAYS_MS = [0, 1_500, 4_000];
+const WAKE_RETRY_INTERVAL_MS = 30_000;
+const WAKE_RETRY_MAX = 6;
+const TYPING_KEEPALIVE_MS = 5_000;
+const TYPING_MAX_MS = 180_000;
+const SUPERVISE_MS = 5_000;
+const ABANDON_CHECK_MS = 15_000;
+const SEEN_MAX = 2_000;
+
+const errText = (err) => (err instanceof Error ? err.message : String(err));
+
+// --- inbound dedupe (iLink may redeliver after a cursor reset) ---------------
+const seenIds = new Set();
+function isNewInbound(m) {
+  const id = m.message_id;
+  if (!id) return true;
+  const key = `${m.ilink_bot_id}:${id}`;
+  if (seenIds.has(key)) return false;
+  seenIds.add(key);
+  if (seenIds.size > SEEN_MAX) seenIds.delete(seenIds.values().next().value);
+  return true;
 }
 
-function stampSessionContext(messages) {
+// --- typing: on immediately, then keepalive until the reply is sent ----------
+const typingWatch = new Map(); // "bot::peer" -> { botId, peer, since }
+
+function startTyping(messages, log) {
+  const now = Date.now();
+  const seen = new Set();
+  for (const m of messages) {
+    if (!m.from_user_id) continue;
+    const botId = m.ilink_bot_id || "";
+    const key = `${botId}::${m.from_user_id}`;
+    typingWatch.set(key, { botId, peer: m.from_user_id, since: now });
+    if (seen.has(key)) continue;
+    seen.add(key);
+    setTyping(m.from_user_id, true, botId || undefined)
+      .then(() => log(`typing on peer=${m.from_user_id} bot=${botId}`))
+      .catch((err) => log(`typing error peer=${m.from_user_id} ${errText(err)}`));
+  }
+}
+
+function typingTick() {
+  const now = Date.now();
+  for (const [key, w] of typingWatch) {
+    // Stop once we replied (send turns typing off) or after a hard ceiling.
+    if (now - w.since > TYPING_MAX_MS || lastAssistantAt(w.botId, w.peer) >= w.since) {
+      typingWatch.delete(key);
+      continue;
+    }
+    setTyping(w.peer, true, w.botId || undefined).catch(() => {});
+  }
+}
+
+// --- wake ---------------------------------------------------------------------
+async function postOnce(cfg, body) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), WAKE_TIMEOUT_MS);
+  try {
+    const res = await fetch(cfg.url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${cfg.key}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    return { ok: res.ok, status: res.status, text };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** POST with a couple of quick retries. Client errors (4xx except 429) are not retried. */
+async function postWake(cfg, body, botId, log) {
+  for (const delay of WAKE_ATTEMPT_DELAYS_MS) {
+    if (delay) await sleep(delay);
+    try {
+      const r = await postOnce(cfg, body);
+      log(`wake bot=${botId} n=${body.n} ${r.status} ${r.text.slice(0, 100)}`);
+      if (r.ok) return true;
+      if (r.status >= 400 && r.status < 500 && r.status !== 429) return false;
+    } catch (err) {
+      log(`wake error bot=${botId} ${errText(err)}`);
+    }
+  }
+  return false;
+}
+
+const failedWakes = []; // { botId, ids, tries, next }
+
+async function wakeBot(botId, batch, log) {
+  const state = loadState();
+  const account = findAccount(state, { ilink_bot_id: botId });
+  const cfg = resolveWakeForAccount(account);
+  if (!cfg) {
+    log(`wake skipped bot=${botId}: no wake config`);
+    return true; // nothing to retry
+  }
+  const dedicated = getAccountAssistant(state, botId);
+  const packed = packMsgs(batch, state);
+  const body = {
+    src: "grok-wechat",
+    n: packed.msgs.length,
+    bot: botId,
+    asst: dedicated?.name || "",
+    asst_id: dedicated?.id || "",
+    ...packed,
+    ack: "wechat_ack",
+  };
+  return postWake(cfg, slim(body), botId, log);
+}
+
+async function wakeAgent(messages, log) {
+  const byBot = new Map();
+  for (const m of messages) {
+    const botId = m.ilink_bot_id || "";
+    if (!byBot.has(botId)) byBot.set(botId, []);
+    byBot.get(botId).push(m);
+  }
+  await Promise.all([...byBot.entries()].map(async ([botId, batch]) => {
+    const ok = await wakeBot(botId, batch, log);
+    if (!ok) {
+      // Stays in the inbox (un-acked); keep retrying in the background.
+      failedWakes.push({
+        botId,
+        ids: batch.map((m) => m.id).filter(Boolean),
+        tries: 0,
+        next: Date.now() + WAKE_RETRY_INTERVAL_MS,
+      });
+    }
+  }));
+}
+
+async function retryFailedWakes(log) {
+  const now = Date.now();
+  for (let i = failedWakes.length - 1; i >= 0; i--) {
+    const f = failedWakes[i];
+    if (f.next > now) continue;
+    const still = inboxByIds(f.ids); // acked/handled messages drop out
+    if (!still.length || f.tries >= WAKE_RETRY_MAX) {
+      failedWakes.splice(i, 1);
+      continue;
+    }
+    f.tries += 1;
+    f.next = now + WAKE_RETRY_INTERVAL_MS;
+    const ok = await wakeBot(f.botId, still, log);
+    if (ok) failedWakes.splice(i, 1);
+  }
+}
+
+// --- inbound batching ----------------------------------------------------------
+const pending = new Map(); // botId -> { msgs, timer }
+
+function stampBatch(messages) {
   const state = loadState();
   for (const m of messages) {
     const dedicated = getAccountAssistant(state, m.ilink_bot_id);
     m.session_id = m.session_id || talkKey(m.ilink_bot_id, m.from_user_id);
-    m.dedicated_assistant_id = dedicated?.id || m.dedicated_assistant_id || "";
     m.dedicated_assistant_name = dedicated?.name || m.dedicated_assistant_name || "";
-    // Prior turns only — current inbound is recorded after this stamp. Full history, no cap.
-    m.history = getTalkHistory(m.ilink_bot_id, m.from_user_id);
+    // Turns that existed before this batch; the history itself is read lazily (no copy stored).
+    m.hist_n = getTalkCount(m.ilink_bot_id, m.from_user_id);
   }
 }
 
@@ -435,61 +576,37 @@ function recordInboundTalks(messages) {
   }
 }
 
-const COALESCE_MS = 700;
-const WAKE_TIMEOUT_MS = 12_000;
-
-async function wakeAgent(messages, log) {
-  if (!messages.length) return;
-  const state = loadState();
-  const byBot = new Map();
-  for (const m of messages) {
-    const botId = m.ilink_bot_id || "";
-    if (!byBot.has(botId)) byBot.set(botId, []);
-    byBot.get(botId).push(m);
-  }
-  await Promise.all([...byBot.entries()].map(async ([botId, batch]) => {
-    const account = findAccount(state, { ilink_bot_id: botId });
-    const cfg = resolveWakeForAccount(account);
-    if (!cfg) {
-      log(`wake skipped bot=${botId}: no wake config`);
-      return;
-    }
-    const dedicated = getAccountAssistant(state, botId);
-    const msgs = batch.map((m) => formatAgentMsg(m, state));
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), WAKE_TIMEOUT_MS);
-      let res;
-      try {
-        res = await fetch(cfg.url, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${cfg.key}`,
-            "Content-Type": "application/json",
-          },
-          // Full payload so the agent can skip wechat_inbox on the happy path.
-          body: JSON.stringify({
-            src: "grok-wechat",
-            n: msgs.length,
-            bot: botId,
-            asst: dedicated?.name || account?.dedicatedAssistant?.name || "",
-            asst_id: dedicated?.id || account?.dedicatedAssistant?.id || "",
-            msgs,
-            ack: "wechat_ack",
-          }),
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-      const text = await res.text();
-      log(`wake bot=${botId} n=${msgs.length} ${res.status} ${text.slice(0, 120)}`);
-    } catch (err) {
-      log(`wake error bot=${botId} ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }));
+async function flush(botId, log) {
+  const slot = pending.get(botId);
+  if (!slot) return;
+  pending.delete(botId);
+  const batch = slot.msgs;
+  if (!batch.length) return;
+  stampBatch(batch);
+  recordInboundTalks(batch);
+  const stored = appendInbox(batch);
+  batch.forEach((m, i) => {
+    if (stored[i]?.id) m.id = stored[i].id;
+  });
+  log(`inbox +${batch.length} bot=${botId}`);
+  await wakeAgent(batch, log);
 }
 
+/** Typing starts instantly; the wake waits a beat so a burst becomes one cold start. */
+function enqueue(botId, messages, log) {
+  const fresh = messages.filter(isNewInbound);
+  if (!fresh.length) return;
+  startTyping(fresh, log);
+  let slot = pending.get(botId);
+  if (!slot) {
+    slot = { msgs: [], timer: null };
+    pending.set(botId, slot);
+  }
+  slot.msgs.push(...fresh);
+  if (!slot.timer) slot.timer = setTimeout(() => { flush(botId, log).catch((err) => log(`flush error ${errText(err)}`)); }, COALESCE_MS);
+}
+
+// --- polling -------------------------------------------------------------------
 async function pollAccount(account, log) {
   const raw = await getUpdates(account);
   if (raw.session_expired) {
@@ -498,8 +615,34 @@ async function pollAccount(account, log) {
   }
   const collected = await collectInbound(raw.msgs || [], account);
   const state = loadState();
-  const allowed = collected.messages.filter((m) => isAllowed(state, m.from_user_id));
-  return { messages: allowed, expired: false };
+  return { messages: collected.messages.filter((m) => isAllowed(state, m.from_user_id)), expired: false };
+}
+
+const loops = new Map(); // token -> { stop }
+
+/** Each account long-polls independently so one idle account never delays another. */
+async function accountLoop(token, ctl, log) {
+  const first = findAccount(loadState(), { token });
+  if (first) await notifyStart(first);
+  let failures = 0;
+  while (!ctl.stop) {
+    const account = findAccount(loadState(), { token });
+    if (!account?.token) break;
+    try {
+      const r = await pollAccount(account, log);
+      failures = 0;
+      if (r.expired) {
+        await sleep(60_000);
+        continue;
+      }
+      if (r.messages.length) enqueue(account.ilinkBotId, r.messages, log);
+    } catch (err) {
+      failures += 1;
+      log(`getupdates error bot=${account.ilinkBotId} ${errText(err)}`);
+      await sleep(Math.min(500 * 2 ** (failures - 1), 15_000));
+    }
+  }
+  if (loops.get(token) === ctl) loops.delete(token);
 }
 
 async function runMonitor() {
@@ -508,62 +651,50 @@ async function runMonitor() {
     logStream.write(`${new Date().toISOString()} ${line}\n`);
   };
   log("monitor start");
-  const accounts = listAccounts();
-  await Promise.all(accounts.map((a) => notifyStart(a)));
   const onExit = async () => {
-    const current = listAccounts();
-    await Promise.all(current.map((a) => notifyStop(a)));
+    await Promise.all(listAccounts().map((a) => notifyStop(a)));
     clearPid();
     process.exit(0);
   };
   process.on("SIGTERM", onExit);
   process.on("SIGINT", onExit);
-  let failures = 0;
-  while (true) {
-    try {
+
+  let lastAbandonCheck = 0;
+  const supervise = () => {
+    const now = Date.now();
+    if (now - lastAbandonCheck >= ABANDON_CHECK_MS) {
+      lastAbandonCheck = now;
       if (connectorAbandoned()) {
         log("connector removed, running uninstall");
         runUninstall();
         process.exit(0);
       }
-      const accountsNow = listAccounts();
-      if (!accountsNow.length) {
-        log("no accounts, stopping");
-        clearPid();
-        process.exit(0);
-      }
-      let results = await Promise.all(accountsNow.map((account) => pollAccount(account, log)));
-      failures = 0;
-      let batch = results.flatMap((r) => r.messages);
-      if (results.some((r) => r.expired)) {
-        await sleep(60_000);
-      }
-      if (batch.length) {
-        // Show typing ASAP on first sight; coalesce follow-ups into one cold start.
-        void startTypingForInbound(batch, log);
-        await sleep(COALESCE_MS);
-        const more = await Promise.all(listAccounts().map((account) => pollAccount(account, log)));
-        const extra = more.flatMap((r) => r.messages);
-        if (extra.length) {
-          batch = batch.concat(extra);
-          void startTypingForInbound(extra, log);
-        }
-        stampSessionContext(batch);
-        recordInboundTalks(batch);
-        const stored = appendInbox(batch);
-        for (let i = 0; i < batch.length; i++) {
-          if (stored[i]?.id) batch[i].id = stored[i].id;
-        }
-        log(`inbox +${batch.length} (coalesced)`);
-        // Wake carries full msgs (text/media/hist) so agent can skip wechat_inbox.
-        await wakeAgent(batch, log);
-      }
-    } catch (err) {
-      failures += 1;
-      log(`getupdates error ${err instanceof Error ? err.message : String(err)}`);
-      await sleep(failures >= 3 ? 15_000 : 500);
     }
-  }
+    const accounts = listAccounts();
+    if (!accounts.length) {
+      log("no accounts, stopping");
+      clearPid();
+      process.exit(0);
+    }
+    const live = new Set(accounts.map((a) => a.token));
+    for (const a of accounts) {
+      if (loops.has(a.token)) continue;
+      const ctl = { stop: false };
+      loops.set(a.token, ctl);
+      accountLoop(a.token, ctl, log).catch((err) => log(`loop crashed ${errText(err)}`));
+    }
+    for (const [token, ctl] of loops) {
+      if (!live.has(token)) {
+        ctl.stop = true;
+        loops.delete(token);
+      }
+    }
+    retryFailedWakes(log).catch((err) => log(`wake retry error ${errText(err)}`));
+  };
+
+  supervise();
+  setInterval(supervise, SUPERVISE_MS);
+  setInterval(typingTick, TYPING_KEEPALIVE_MS);
 }
 
 if (process.argv.includes("--monitor")) {

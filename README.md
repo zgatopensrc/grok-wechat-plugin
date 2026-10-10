@@ -11,9 +11,10 @@ Grok Bot 的微信 iLink 渠道。扫码绑定个人号后，私信经共享 web
 - **语音**：按转写文本处理
 - **媒体**：收发图片、视频、文件（入站媒体下载到本机）
 - **正在输入**：monitor 成功收到消息后自动打开，发完自动关闭
-- **会话上下文**：按微信对端持久化完整 talk history（不截断；连续重复轮次自动去重）
-- **Webhook 带正文**：唤醒 payload 含 `msgs`，可省一次 `wechat_inbox`；短时连发会合并为一次唤醒
-- **可靠取件**：`wechat_inbox` 只 peek，成功回复后 `wechat_ack` 再删
+- **会话上下文**：按微信对端持久化完整 talk history（**不截断**；追加写入的 per-peer 文件；连续重复的助手回复自动合并，用户重复的话保留）
+- **Webhook 带正文**：唤醒 payload 含 `msgs` 与 `hist`（每个会话的历史只发一次），可省一次 `wechat_inbox`
+- **低延迟**：每个账号独立长轮询，互不阻塞；600ms 内连发合并为一次唤醒；收信立即「正在输入」并每 5s 保活直到回复
+- **可靠取件**：`wechat_inbox` 只 peek，成功回复后 `wechat_ack` 再删；入站写入带跨进程锁；webhook 失败自动重试；按 `message_id` 去重
 - **allowlist**：空则接收全部私信；写入后只处理名单内用户
 - **全局 webhook**：粘贴一次，覆盖当前及后续全部已绑定账号
 - **保活**：建议每 20 分钟 `wechat_start_monitor`（勿用 5 分钟）
