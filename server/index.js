@@ -24,6 +24,10 @@ import {
   loadState,
   markAssistantLost,
   monitorRunning,
+  writeHeartbeat,
+  clearHeartbeat,
+  monitorHeartbeatStale,
+  readHeartbeat,
   packMsgs,
   noteBlocked,
   paths,
@@ -85,9 +89,20 @@ async function sleep(ms) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
+const HEARTBEAT_STALE_MS = 90_000; // > 2 long-poll cycles with no successful getupdates
+
 function ensureMonitor() {
   const existing = monitorRunning();
-  if (existing) return { already_running: true, pid: existing };
+  if (existing) {
+    // Pid alone is not enough: a hung long-poll leaves the process alive but deaf.
+    if (!monitorHeartbeatStale(HEARTBEAT_STALE_MS)) {
+      return { already_running: true, pid: existing, healthy: true };
+    }
+    try { process.kill(existing, "SIGTERM"); } catch { /* gone */ }
+    clearPid();
+    clearHeartbeat();
+    // Fall through and start a fresh monitor.
+  }
   const accounts = listAccounts();
   if (!accounts.length) return { started: false, reason: "not_logged_in" };
   const child = spawn(process.execPath, [self, "--monitor"], {
@@ -97,7 +112,13 @@ function ensureMonitor() {
   });
   child.unref();
   writePid(child.pid);
-  return { started: true, pid: child.pid, account_count: accounts.length };
+  writeHeartbeat({ pid: child.pid, boot: true });
+  return {
+    started: true,
+    pid: child.pid,
+    account_count: accounts.length,
+    restarted_stale: Boolean(existing),
+  };
 }
 
 const accountRefSchema = {
@@ -132,6 +153,9 @@ const tools = {
     handle: async () => {
       const payload = statusPayload();
       payload.monitor_pid = monitorRunning();
+      const hb = readHeartbeat();
+      if (hb?.at) payload.monitor_heartbeat_age_ms = Date.now() - Number(hb.at);
+      payload.monitor_stale = monitorHeartbeatStale(HEARTBEAT_STALE_MS);
       return ok(payload);
     },
   },
@@ -181,12 +205,12 @@ const tools = {
     },
   },
   wechat_inbox: {
-    description: "Peek inbox (does NOT clear). Returns msgs[{id,from,bot,text,media,sid,asst}] + hist{sid:[{r,t}]} (full history, until the assistant's thread has it) + thread[sids] (history already in the assistant's thread, not resent). Prefer the wake payload if present. After replying call wechat_ack.",
+    description: "Peek inbox (no clear). Prefer wake payload. Reply then wechat_ack.",
     inputSchema: { type: "object", properties: {} },
     handle: async () => ok({ ...peekInbox(), ack: "wechat_ack" }),
   },
   wechat_ack: {
-    description: "Ack/remove inbox msgs after successful reply (call AFTER wechat_send). Pass ids from msgs; omit ids to clear all. `unsynced` lists conversations acked with no reply sent since: their history will be resent.",
+    description: "After wechat_send: remove inbox ids (omit=all). unsynced=needs hist again.",
     inputSchema: {
       type: "object",
       properties: {
@@ -225,7 +249,7 @@ const tools = {
       ok(await sendMedia(to_user_id, path, kind, caption, ilink_bot_id)),
   },
   wechat_typing: {
-    description: "Typing on/off. Auto-on after receive; auto-off after send.",
+    description: "Typing on/off (usually auto).",
     inputSchema: {
       type: "object",
       properties: {
@@ -243,7 +267,7 @@ const tools = {
     handle: async () => ok(ensureMonitor()),
   },
   wechat_set_wake: {
-    description: "Save wake webhook url+key. With ilink_bot_id: that account's own webhook, created under its dedicated assistant so wakes go straight to it (no dispatcher). Without: global fallback for accounts that have none.",
+    description: "Save wake url+key. With ilink_bot_id=own (direct); without=global fallback.",
     inputSchema: {
       type: "object",
       properties: {
@@ -256,7 +280,7 @@ const tools = {
     handle: async ({ ilink_bot_id, url, key }) => ok(await setAccountWake(ilink_bot_id, url, key)),
   },
   wechat_set_dedicated_assistant: {
-    description: "Register per-account dedicated assistant. Re-registering resets sync: the next wake carries full history again.",
+    description: "Register dedicated assistant. Re-register resets hist sync.",
     inputSchema: {
       type: "object",
       properties: {
@@ -281,7 +305,7 @@ const tools = {
     },
   },
   wechat_approve: {
-    description: "Allowlist (default-deny; the account owner is always allowed). user_id=allow that sender; clear=empty the list. No args: list allow_from + recently blocked senders.",
+    description: "Allowlist (default-deny; owner always ok). user_id / clear / no-args=list.",
     inputSchema: {
       type: "object",
       properties: {
@@ -340,7 +364,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.11.1" },
+        serverInfo: { name: "grok-wechat", version: "1.11.3" },
       },
     };
   }
@@ -414,7 +438,7 @@ function startMcp() {
 // Burst merging: wake once no new message has arrived for IDLE ms, but never later than
 // CAP ms after the first message of the burst. A lone message therefore waits ~IDLE, not CAP.
 const DEFAULT_COALESCE_MS = 3000; // CAP (GROK_WECHAT_COALESCE_MS)
-const DEFAULT_COALESCE_IDLE_MS = 1000; // GROK_WECHAT_COALESCE_IDLE_MS
+const DEFAULT_COALESCE_IDLE_MS = 500; // GROK_WECHAT_COALESCE_IDLE_MS
 
 /** Non-negative integer milliseconds. Unset, blank, or invalid values use the default. */
 function readMs(raw, dflt) {
@@ -546,15 +570,20 @@ async function wakeBot(botId, batch, log) {
   }
   const dedicated = getAccountAssistant(state, botId);
   const packed = packMsgs(batch, state);
+  // Compact wake: no src/n; msgs drop redundant bot/asst (top-level has them).
+  if (packed.msgs) {
+    packed.msgs = packed.msgs.map((m) => {
+      const { bot: _b, asst: _a, ...rest } = m;
+      return rest;
+    });
+  }
   const body = {
-    src: "grok-wechat",
-    n: packed.msgs.length,
     bot: botId,
     asst: dedicated?.name || "",
     asst_id: dedicated?.id || "",
     ...packed,
     warn: account?.lostAssistant
-      ? `assistant_missing:${account.lostAssistant.name || account.lostAssistant.id} - tell the user; recreate it and wechat_set_dedicated_assistant`
+      ? `assistant_missing:${account.lostAssistant.name || account.lostAssistant.id}`
       : undefined,
     ack: "wechat_ack",
   };
@@ -824,15 +853,22 @@ async function accountLoop(token, ctl, log) {
     try {
       const r = await pollAccount(account, log);
       failures = 0;
+      writeHeartbeat({ bot: account.ilinkBotId, ok: true });
       if (r.expired) {
         await handleExpired(account, log).catch((err) => log(`expiry notice error ${errText(err)}`));
+        writeHeartbeat({ bot: account.ilinkBotId, expired: true });
         await sleep(EXPIRED_RETRY_MS);
         continue;
       }
       if (r.messages.length) enqueue(account.ilinkBotId, r.messages, log);
     } catch (err) {
       failures += 1;
-      log(`getupdates error bot=${account.ilinkBotId} ${errText(err)}`);
+      log(`getupdates error bot=${account.ilinkBotId} ${errText(err)} failures=${failures}`);
+      // After a few hard failures, re-bind the session so idle reconnects recover faster.
+      if (failures === 3 || failures % 10 === 0) {
+        await notifyStart(account).catch(() => {});
+        log(`re-notifyStart after failures bot=${account.ilinkBotId}`);
+      }
       await sleep(Math.min(500 * 2 ** (failures - 1), 15_000));
     }
   }
@@ -849,6 +885,7 @@ async function runMonitor() {
   const onExit = async () => {
     await Promise.all(listAccounts().map((a) => notifyStop(a)));
     clearPid();
+    clearHeartbeat();
     process.exit(0);
   };
   process.on("SIGTERM", onExit);
