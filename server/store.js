@@ -21,6 +21,7 @@ export function paths() {
     pid: path.join(home, "monitor.pid"),
     media: path.join(home, "media"),
     log: path.join(home, "monitor.log"),
+    heartbeat: path.join(home, "monitor.heartbeat"),
     seen: path.join(home, "seen.log"),
     blocked: path.join(home, "blocked.json"),
     debug: path.join(home, "mcp-host.log"),
@@ -549,7 +550,13 @@ export function formatAgentMsg(msg, state = loadState()) {
     bot: msg.ilink_bot_id,
     text: msg.text || undefined,
     media: media.length
-      ? media.map((it) => slim({ type: it.type, path: it.path, name: it.name, text: it.text }))
+      ? media.map((it) => {
+          // Prefer transcription text; keep path/name only when useful for non-voice.
+          if (it.text && (it.type === "voice" || it.type === "audio" || !it.path)) {
+            return slim({ type: it.type, text: it.text });
+          }
+          return slim({ type: it.type, path: it.path, name: it.name, text: it.text });
+        })
       : undefined,
     sid: msg.session_id || talkKey(msg.ilink_bot_id, msg.from_user_id),
     asst: dedicated?.name || undefined,
@@ -750,6 +757,35 @@ export function isPidAlive(pid) {
   } catch {
     return false;
   }
+}
+
+
+export function writeHeartbeat(extra = {}) {
+  ensureHome();
+  const body = JSON.stringify({ at: Date.now(), ...extra });
+  fs.writeFileSync(paths().heartbeat, body);
+}
+
+export function readHeartbeat() {
+  const { heartbeat } = paths();
+  if (!fs.existsSync(heartbeat)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(heartbeat, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+export function clearHeartbeat() {
+  const { heartbeat } = paths();
+  if (fs.existsSync(heartbeat)) fs.unlinkSync(heartbeat);
+}
+
+/** True if monitor pid is alive but has not reported a successful poll recently. */
+export function monitorHeartbeatStale(maxAgeMs = 90_000) {
+  const hb = readHeartbeat();
+  if (!hb?.at) return true;
+  return Date.now() - Number(hb.at) > maxAgeMs;
 }
 
 export function monitorRunning() {
