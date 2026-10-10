@@ -174,7 +174,7 @@ const tools = {
     handle: async () => ok({ ...peekInbox(), ack: "wechat_ack" }),
   },
   wechat_ack: {
-    description: "Ack/remove inbox msgs after successful reply. Pass ids from msgs; omit ids to clear all.",
+    description: "Ack/remove inbox msgs after successful reply (call AFTER wechat_send). Pass ids from msgs; omit ids to clear all. `unsynced` lists conversations acked with no reply sent since: their history will be resent.",
     inputSchema: {
       type: "object",
       properties: {
@@ -327,7 +327,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.7.0" },
+        serverInfo: { name: "grok-wechat", version: "1.7.1" },
       },
     };
   }
@@ -561,6 +561,7 @@ function stampBatch(messages) {
     m.dedicated_assistant_name = dedicated?.name || m.dedicated_assistant_name || "";
     // Turns that existed before this batch; the history itself is read lazily (no copy stored).
     m.hist_n = getTalkCount(m.ilink_bot_id, m.from_user_id);
+    m.recv_at = Date.now(); // ack guard: a reply must be sent after this before the thread counts as synced
   }
 }
 

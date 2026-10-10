@@ -607,9 +607,24 @@ export function ackInbox(ids) {
     writeInboxRaw(kept);
     return { acked: raw.length - kept.length, remaining: kept.length };
   });
-  // Handled => the assistant's thread now holds these conversations.
-  if (dropped.length) markSeeded(dropped);
-  return result;
+  // Handled => the assistant's thread now holds these conversations. Guard against an
+  // early ack: only count a conversation as synced if a reply was actually sent after
+  // its latest acked message (rows without recv_at are never trusted).
+  const latest = new Map(); // sid -> { row, recv }
+  for (const m of dropped) {
+    const sid = m.session_id || talkKey(m.ilink_bot_id, m.from_user_id);
+    const recv = typeof m.recv_at === "number" ? m.recv_at : Number.POSITIVE_INFINITY;
+    const cur = latest.get(sid);
+    if (!cur || recv > cur.recv) latest.set(sid, { row: m, recv });
+  }
+  const ok = [];
+  const unsynced = [];
+  for (const [sid, { row, recv }] of latest) {
+    if (lastAssistantAt(row.ilink_bot_id, row.from_user_id) >= recv) ok.push(row);
+    else unsynced.push(sid);
+  }
+  if (ok.length) markSeeded(ok);
+  return unsynced.length ? { ...result, unsynced } : result;
 }
 
 export function peekInboxCount() {

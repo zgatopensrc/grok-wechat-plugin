@@ -43,7 +43,7 @@ MCP `grok-wechat` → iLink。
 
 1. 用 `msgs`（+`hist`，若有）在专属助手原会话里理解并回复（webhook 缺失/失败时 `wechat_inbox`，它**只 peek 不清空**）
 2. `wechat_send`（`to_user_id=from`，带同一 `bot`）
-3. **`wechat_ack`（`ids` = msgs 的 id）**，须在助手已回复之后（ack 即视为该会话已同步到助手会话）。未 ack 的消息保留；webhook 失败时 monitor 会自动重试唤醒（最多 6 次，间隔 30s）
+3. **`wechat_ack`（`ids` = msgs 的 id）**，须在 `wechat_send` 之后：只有 ack 时插件已记录到晚于该消息的回复，才视为该会话已同步到助手会话；提前 ack 会在返回里列出 `unsynced`，其历史下次唤醒会重发。未 ack 的消息保留；webhook 失败时 monitor 会自动重试唤醒（最多 6 次，间隔 30s）
 
 ## 工具
 
