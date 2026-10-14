@@ -96,6 +96,10 @@ async function sleep(ms) {
 
 const HEARTBEAT_STALE_MS = 90_000; // > ~2 long-poll cycles with no getupdates return
 const MCP_WATCHDOG_MS = 30_000; // MCP host re-checks monitor; replaces Ori cron keepalive
+// Hard ceiling around one getupdates (ilink long-poll is 35s + 5s abort). If AbortSignal
+// fails to fire, Promise.race still forces recovery instead of a forever-hung account loop.
+const POLL_HARD_TIMEOUT_MS = 50_000;
+const SELF_HEAL_MS = 15_000; // monitor checks its own heartbeat; does not need MCP host
 
 function ensureMonitor() {
   return withMonitorLock(() => {
@@ -402,7 +406,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.11.9" },
+        serverInfo: { name: "grok-wechat", version: "1.11.11" },
       },
     };
   }
@@ -480,8 +484,8 @@ function startMcp() {
 
 // Burst merging: wake once no new message has arrived for IDLE ms, but never later than
 // CAP ms after the first message of the burst. A lone message therefore waits ~IDLE, not CAP.
-const DEFAULT_COALESCE_MS = 3000; // CAP (GROK_WECHAT_COALESCE_MS)
-const DEFAULT_COALESCE_IDLE_MS = 500; // GROK_WECHAT_COALESCE_IDLE_MS
+const DEFAULT_COALESCE_MS = 7000; // CAP (GROK_WECHAT_COALESCE_MS)
+const DEFAULT_COALESCE_IDLE_MS = 2000; // GROK_WECHAT_COALESCE_IDLE_MS
 
 /** Non-negative integer milliseconds. Unset, blank, or invalid values use the default. */
 function readMs(raw, dflt) {
@@ -913,6 +917,22 @@ async function handleExpired(account, log) {
 
 const loops = new Map(); // token -> { stop }
 
+/** Replace this monitor process. Used when a poll hangs past POLL_HARD_TIMEOUT or our own heartbeat goes stale — does not depend on the MCP host watchdog. */
+function respawnMonitor(log, reason) {
+  try {
+    log(`monitor self-respawn: ${reason}`);
+  } catch { /* ignore */ }
+  const child = spawn(process.execPath, [self, "--monitor"], {
+    detached: true,
+    stdio: "ignore",
+    env: process.env,
+  });
+  child.unref();
+  writePid(child.pid);
+  writeHeartbeat({ pid: child.pid, boot: true, replaced: process.pid, reason: String(reason).slice(0, 200) });
+  process.exit(0);
+}
+
 /** Each account long-polls independently so one idle account never delays another. */
 async function accountLoop(token, ctl, log) {
   const first = findAccount(loadState(), { token });
@@ -922,7 +942,14 @@ async function accountLoop(token, ctl, log) {
     const account = findAccount(loadState(), { token });
     if (!account?.token) break;
     try {
-      const r = await pollAccount(account, log);
+      const r = await Promise.race([
+        pollAccount(account, log),
+        sleep(POLL_HARD_TIMEOUT_MS).then(() => {
+          const err = new Error(`poll hard timeout ${POLL_HARD_TIMEOUT_MS}ms`);
+          err.name = "PollHardTimeout";
+          throw err;
+        }),
+      ]);
       failures = 0;
       writeHeartbeat({ bot: account.ilinkBotId, ok: true });
       if (r.expired) {
@@ -933,6 +960,11 @@ async function accountLoop(token, ctl, log) {
       }
       if (r.messages.length) enqueue(account.ilinkBotId, r.messages, log);
     } catch (err) {
+      if (err?.name === "PollHardTimeout") {
+        // Underlying fetch may still be wedged; replace the whole process.
+        respawnMonitor(log, err.message);
+        return;
+      }
       failures += 1;
       // Still breathing: avoid stale-kill restart storms during transient network errors.
       // Hung polls that never return still go stale (no heartbeat) and get restarted.
@@ -1016,6 +1048,17 @@ async function runMonitor() {
   supervise();
   setInterval(supervise, SUPERVISE_MS);
   setInterval(() => typingTick(log), TYPING_KEEPALIVE_MS);
+  // Self-heal inside the monitor: if heartbeat stops advancing (wedged poll/event loop still
+  // ticking), respawn ourselves. MCP host watchdog remains a backup when hosts are up.
+  setInterval(() => {
+    try {
+      if (readPid() === process.pid && monitorHeartbeatStale(HEARTBEAT_STALE_MS)) {
+        respawnMonitor(log, `own heartbeat stale >${HEARTBEAT_STALE_MS}ms`);
+      }
+    } catch (err) {
+      log(`self-heal error ${errText(err)}`);
+    }
+  }, SELF_HEAL_MS);
 }
 
 if (process.argv.includes("--monitor")) {

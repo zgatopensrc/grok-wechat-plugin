@@ -270,7 +270,14 @@ async function downloadMedia(media, label) {
   const fullUrl = media?.full_url || "";
   if (!param && !fullUrl) return null;
   const url = fullUrl || `${CDN_BASE}/download?encrypted_query_param=${encodeURIComponent(param)}`;
-  const res = await fetch(url);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) throw new Error(`下载媒体失败 ${res.status}`);
   const cipher = Buffer.from(await res.arrayBuffer());
   const key = parseAesKey(media.aes_key);
