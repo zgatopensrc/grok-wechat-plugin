@@ -253,7 +253,7 @@ function platformCleanup(dedicatedAssistants) {
     dedicated_assistant_sidebar_names: sidebarNames,
     execute: [
       "从 Grok Bot Settings 卸载 grok-wechat 连接器（若仍存在）",
-      "卸载时删除 Routine「微信入站唤醒」与「微信监听保活」（二者都随本渠道清掉；保活是约每 20 分钟唤醒盒子的 cron，并非废弃。安装期间应保持保活启用，且不要建入站唤醒 webhook）",
+      "卸载时删除 Routine「微信入站唤醒」与「微信监听保活」（二者都随本渠道清掉；保活是每 5 分钟唤醒盒子的 cron，并非废弃。安装期间应保持保活启用，且不要建入站唤醒 webhook）",
       "若用过每号直达：删除各专属助手名下的 Routine「微信入站唤醒-<助手名>」（随助手一起删也行）",
       "删除其他助手上残留的同名 Routine",
       sidebarNames.length
