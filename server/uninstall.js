@@ -3,11 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { clearPid, homeDir, listAccounts, loadState, monitorRunning, readPid } from "./store.js";
+import { clearPid, clearHeartbeat, homeDir, listAccounts, listMonitorPids, loadState, MONITOR_CMDLINE, stopMonitorPids } from "./store.js";
 
 const PLUGIN_DIR_NAMES = ["grok-wechat-plugin"];
 const GROK_BOX_HOME = "/home/box";
-const MONITOR_MATCH = "grok-wechat-plugin/server/index.js --monitor";
+const MONITOR_MATCH = MONITOR_CMDLINE;
 const MCP_MATCH = "grok-wechat-plugin/server/index.js";
 
 function isPluginDir(dir) {
@@ -45,35 +45,10 @@ function sh(cmd) {
   return execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
 
-function listMonitorPids() {
-  const pids = new Set();
-  const fromFile = readPid();
-  if (fromFile) pids.add(fromFile);
-  const running = monitorRunning();
-  if (running) pids.add(running);
-  try {
-    const out = sh(`pgrep -f "${MONITOR_MATCH}" 2>/dev/null || true`);
-    for (const line of out.split("\n")) {
-      const n = Number(line.trim());
-      if (Number.isFinite(n) && n > 0) pids.add(n);
-    }
-  } catch {
-    // ignore
-  }
-  return [...pids];
-}
-
 export function stopAllMonitors() {
-  const stopped = [];
-  for (const pid of listMonitorPids()) {
-    try {
-      process.kill(pid, "SIGTERM");
-      stopped.push(pid);
-    } catch {
-      // already gone
-    }
-  }
+  const stopped = stopMonitorPids(listMonitorPids());
   clearPid();
+  clearHeartbeat();
   try {
     sh(`pkill -TERM -f "${MONITOR_MATCH}" 2>/dev/null || true`);
   } catch {
@@ -196,13 +171,30 @@ function deferredCleanupShell() {
   const stateDirs = knownStateHomes().map((d) => `"${d}"`).join(" ");
   const pluginDirs = knownPluginDirs().map((d) => `"${d}"`).join(" ");
   return `
-sleep 3
+sleep 45
 if pgrep -f "${MCP_MATCH}" >/dev/null 2>&1; then
   for pid in $(pgrep -f "${MCP_MATCH}" 2>/dev/null || true); do
     args=$(ps -p "$pid" -o args= 2>/dev/null || true)
     case "$args" in *--monitor*|*--uninstall*) ;; *) exit 0 ;; esac
   done
 fi
+now=$(date +%s)
+for d in ${stateDirs}; do
+  f="$d/connector-active"
+  if [ -f "$f" ]; then
+    mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+    age=$((now - mt))
+    if [ "$age" -lt 120 ]; then exit 0; fi
+  fi
+  hb="$d/monitor.heartbeat"
+  if [ -f "$hb" ]; then
+    at=$(sed -n 's/.*"at":\\([0-9]*\\).*/\\1/p' "$hb" | head -1)
+    if [ -n "$at" ]; then
+      age_ms=$((now * 1000 - at))
+      if [ "$age_ms" -lt 120000 ]; then exit 0; fi
+    fi
+  fi
+done
 pkill -TERM -f "${MONITOR_MATCH}" 2>/dev/null || true
 for d in ${stateDirs}; do rm -rf "$d" 2>/dev/null || true; done
 for d in ${pluginDirs}; do rm -rf "$d" 2>/dev/null || true; done
@@ -261,7 +253,7 @@ function platformCleanup(dedicatedAssistants) {
     dedicated_assistant_sidebar_names: sidebarNames,
     execute: [
       "从 Grok Bot Settings 卸载 grok-wechat 连接器（若仍存在）",
-      "删除安装助手上 Routine「微信入站唤醒」与「微信监听保活」",
+      "若仍有残留：删除 Routine「微信入站唤醒」与「微信监听保活」（1.11.7+ 安装不再需要保活 Routine；插件 MCP watchdog 自愈）",
       "若用过每号直达：删除各专属助手名下的 Routine「微信入站唤醒-<助手名>」（随助手一起删也行）",
       "删除其他助手上残留的同名 Routine",
       sidebarNames.length

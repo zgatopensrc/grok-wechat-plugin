@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -47,6 +48,8 @@ export function emptyState() {
     accounts: [],
     pendingQrs: [],
     allowFrom: [],
+    // Installing assistant (e.g. Ori): sendPrompt fallback when dedicated handoff fails / no asst / demoted.
+    handoffFrom: null,
   };
 }
 
@@ -790,50 +793,147 @@ export function monitorHeartbeatStale(maxAgeMs = 90_000) {
 
 export function monitorRunning() {
   const pid = readPid();
+  // Non-positive / corrupt pid file → treat as absent (avoids "pid 0" ghosts).
+  if (!pid || pid <= 0) {
+    if (fs.existsSync(paths().pid)) clearPid();
+    return 0;
+  }
   if (isPidAlive(pid)) return pid;
-  if (pid) clearPid();
+  clearPid();
   return 0;
 }
 
+/** cmdline fragment that identifies the long-poll monitor process */
+export const MONITOR_CMDLINE = "grok-wechat-plugin/server/index.js --monitor";
+
+/**
+ * All live --monitor PIDs (pid file + pgrep). Used to reap orphans / dual monitors.
+ */
+export function listMonitorPids() {
+  const pids = new Set();
+  const fromFile = readPid();
+  if (fromFile > 0) pids.add(fromFile);
+  try {
+    const out = execSync(`pgrep -f "${MONITOR_CMDLINE}" 2>/dev/null || true`, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    for (const line of out.split("\n")) {
+      const n = Number(line.trim());
+      if (Number.isFinite(n) && n > 1) pids.add(n);
+    }
+  } catch {
+    // ignore
+  }
+  return [...pids].filter((p) => p > 1 && isPidAlive(p));
+}
+
+export function killMonitorPid(pid, signal = "SIGTERM") {
+  if (!pid || pid <= 1 || pid === process.pid) return false;
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** SIGTERM then brief wait then SIGKILL leftovers.
+ *  clearFiles (default true): also wipe monitor.pid + heartbeat — use false when
+ *  only reaping orphans while a healthy monitor must keep its pid file.
+ */
+export function stopMonitorPids(pids, { waitMs = 1500, clearFiles = true } = {}) {
+  const list = [...new Set(pids)].filter((p) => p > 1);
+  for (const pid of list) killMonitorPid(pid, "SIGTERM");
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    const alive = list.filter(isPidAlive);
+    if (!alive.length) break;
+    try {
+      execSync("sleep 0.05", { stdio: "ignore" });
+    } catch {
+      break;
+    }
+  }
+  for (const pid of list) {
+    if (isPidAlive(pid)) killMonitorPid(pid, "SIGKILL");
+  }
+  if (clearFiles) {
+    clearPid();
+    clearHeartbeat();
+  }
+  return list;
+}
+
+/**
+ * Exclusive short lock so concurrent MCP hosts do not spawn dual monitors.
+ * Stale locks (dead holder or >15s) are stolen.
+ */
+export function withMonitorLock(fn) {
+  ensureHome();
+  const lockPath = path.join(homeDir(), "monitor.lock");
+  const staleMs = 15_000;
+  for (let attempt = 0; attempt < 50; attempt++) {
+    let fd;
+    try {
+      fd = fs.openSync(lockPath, "wx");
+      fs.writeFileSync(fd, `${process.pid}\n${Date.now()}\n`);
+      try {
+        return fn();
+      } finally {
+        try { fs.closeSync(fd); } catch { /* ignore */ }
+        try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
+      }
+    } catch (err) {
+      if (err && err.code !== "EEXIST") throw err;
+      try {
+        const body = fs.readFileSync(lockPath, "utf8");
+        const [pidStr, atStr] = body.split("\n");
+        const holder = Number(pidStr);
+        const at = Number(atStr);
+        const stale = (Number.isFinite(at) && Date.now() - at > staleMs)
+          || (holder > 0 && !isPidAlive(holder));
+        if (stale) {
+          try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
+          continue;
+        }
+      } catch {
+        try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
+        continue;
+      }
+      try { execSync("sleep 0.05", { stdio: "ignore" }); } catch { /* ignore */ }
+    }
+  }
+  // Last resort: run without lock rather than hang forever.
+  return fn();
+}
+
+/** Legacy path; external Cursor webhook wake removed in 1.11.6. File may still exist unused. */
 export function fallbackWakePath() {
   return path.join(homeDir(), "wake.json");
 }
 
+/** @deprecated External webhook removed; always null at runtime. */
 export function loadFallbackWake() {
-  const wakeFile = fallbackWakePath();
-  if (!fs.existsSync(wakeFile)) return null;
-  try {
-    const cfg = JSON.parse(fs.readFileSync(wakeFile, "utf8"));
-    if (cfg.url && cfg.key) return { url: cfg.url, key: cfg.key };
-  } catch {
-    // ignore
-  }
   return null;
 }
 
-export function saveGlobalWake(url, key) {
-  ensureHome();
-  const wakeFile = fallbackWakePath();
-  const tmp = `${wakeFile}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ url, key }, null, 2));
-  fs.renameSync(tmp, wakeFile);
-  try {
-    fs.chmodSync(wakeFile, 0o600);
-  } catch {
-    // ignore
-  }
+/** @deprecated No-op: external webhook wake removed. */
+export function saveGlobalWake(_url, _key) {
+  return false;
 }
 
+/** @deprecated */
 export function hasGlobalWake() {
-  return Boolean(loadFallbackWake());
+  return false;
 }
 
-export function resolveWakeForAccount(account) {
-  if (account?.wake?.url && account?.wake?.key) return account.wake;
-  return loadFallbackWake();
+/** @deprecated External webhook removed. */
+export function resolveWakeForAccount(_account) {
+  return null;
 }
 
-/** Drop one account's own webhook so it falls back to the global one. Returns true if it had one. */
+/** Drop leftover account.wake (legacy own-webhook field). Returns true if cleared. */
 export function clearAccountWake(ilink_bot_id) {
   let had = false;
   updateState((s) => {
@@ -848,8 +948,30 @@ export function clearAccountWake(ilink_bot_id) {
   return had;
 }
 
-export function hasAccountWake(account) {
-  return hasGlobalWake() || Boolean(account?.wake?.url && account?.wake?.key);
+/** Installing assistant used as sendPrompt fallback (Ori). */
+export function getHandoffFrom(state = loadState()) {
+  const h = state?.handoffFrom;
+  if (h?.id) return { id: h.id, name: h.name || "" };
+  return null;
+}
+
+export function setHandoffFrom(assistant_id, assistant_name) {
+  if (!assistant_id) throw new Error("assistant_id 必填（安装助手 / Ori，作 sendPrompt 兜底）");
+  updateState((s) => {
+    s.handoffFrom = { id: assistant_id, name: assistant_name || "Ori" };
+    return s;
+  });
+  saveStateSecure(loadState());
+  return getHandoffFrom();
+}
+
+export function hasHandoffTarget(state = loadState()) {
+  return Boolean(getHandoffFrom(state)?.id);
+}
+
+/** True if this account can be woken: dedicated asst and/or Ori fallback. */
+export function hasAccountWake(account, state = loadState()) {
+  return Boolean(account?.dedicatedAssistant?.id || getHandoffFrom(state)?.id);
 }
 
 export function saveStateSecure(next) {

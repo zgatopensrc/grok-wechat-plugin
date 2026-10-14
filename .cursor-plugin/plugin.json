@@ -1,12 +1,17 @@
 {
   "name": "grok-wechat",
   "displayName": "Grok WeChat",
-  "version": "1.11.3",
-  "description": "微信 iLink 渠道：扫码、收发、媒体、自动正在输入、每号专属助手+精简上下文。",
+  "version": "1.11.10",
+  "description": "微信 iLink 渠道：扫码、收发、媒体、自动正在输入；每号专属助手用随机英文名命名；入站 sendPrompt handoff；Ori sendPrompt 兜底；无外部 webhook；监听自愈。",
   "author": {
     "name": "little-thing"
   },
-  "keywords": ["wechat", "weixin", "ilink", "mcp"],
+  "keywords": [
+    "wechat",
+    "weixin",
+    "ilink",
+    "mcp"
+  ],
   "mcpServers": "./mcp.json",
   "skills": "./skills"
 }
