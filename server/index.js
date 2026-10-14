@@ -95,7 +95,7 @@ async function sleep(ms) {
 }
 
 const HEARTBEAT_STALE_MS = 90_000; // > ~2 long-poll cycles with no getupdates return
-const MCP_WATCHDOG_MS = 30_000; // MCP host re-checks monitor; replaces Ori cron keepalive
+const MCP_WATCHDOG_MS = 30_000; // awake box: MCP host re-checks monitor. Complements Ori「微信监听保活」; does not replace that external box wake.
 // Hard ceiling around one getupdates (ilink long-poll is 35s + 5s abort). If AbortSignal
 // fails to fire, Promise.race still forces recovery instead of a forever-hung account loop.
 const POLL_HARD_TIMEOUT_MS = 50_000;
@@ -415,7 +415,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.11.12" },
+        serverInfo: { name: "grok-wechat", version: "1.11.13" },
       },
     };
   }
@@ -463,8 +463,9 @@ function startMcp() {
   } catch {
     /* ignore boot ensure errors */
   }
-  // Self-heal without Ori「微信监听保活」: while the connector MCP host is up,
-  // periodically restart a dead/stale/orphan monitor.
+  // Hung-poll self-heal while this process is scheduled. A frozen VM does not
+  // advance this timer; Ori「微信监听保活」wakes the box. Complements that
+  // external wake and does not replace it.
   setInterval(() => {
     try {
       runMcpWatchdogTick("interval");
@@ -1092,8 +1093,9 @@ async function runMonitor() {
   supervise();
   setInterval(supervise, SUPERVISE_MS);
   setInterval(() => typingTick(log), TYPING_KEEPALIVE_MS);
-  // Self-heal inside the monitor: if heartbeat stops advancing (wedged poll/event loop still
-  // ticking), respawn ourselves. MCP host watchdog remains a backup when hosts are up.
+  // Own-heartbeat self-heal while this process is scheduled (VM awake). Does not
+  // run during box freeze; Ori「微信监听保活」is the external wake. MCP watchdog
+  // is the other awake-path backup.
   setInterval(() => {
     try {
       const hb = readHeartbeat();
