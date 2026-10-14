@@ -625,17 +625,21 @@ export function setFallbackAssistant(assistant_id, assistant_name) {
 export function setDedicatedAssistant(ilink_bot_id, assistant_id, assistant_name) {
   if (!ilink_bot_id) throw new Error("ilink_bot_id 必填");
   if (!assistant_name) throw new Error("assistant_name 必填");
+  const prev = findAccount(loadState(), { ilink_bot_id })?.dedicatedAssistant || null;
+  const nextId = assistant_id || prev?.id || "";
+  // Rename-only (same id, new display name): keep hist sync. New/swapped id: resend hist once.
+  const renameOnly = Boolean(nextId && prev?.id && nextId === prev.id);
   updateState((s) => {
     const hit = requireAccount(s, { ilink_bot_id });
     hit.dedicatedAssistant = {
-      id: assistant_id || hit.dedicatedAssistant?.id || "",
+      id: nextId,
       name: assistant_name,
     };
     hit.lostAssistant = null;
     return s;
   });
   saveStateSecure(loadState());
-  resetSeeded(ilink_bot_id); // (re)registering = fresh thread assumed: resend full history once
+  if (!renameOnly) resetSeeded(ilink_bot_id); // (re)registering = fresh thread assumed: resend full history once
   const account = findAccount(loadState(), { ilink_bot_id });
   const hasId = Boolean(assistant_id || account?.dedicatedAssistant?.id);
   const fb = getHandoffFrom();

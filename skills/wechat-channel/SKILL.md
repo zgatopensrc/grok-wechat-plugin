@@ -6,6 +6,8 @@ description: 安装/登录/收发/卸载微信 iLink。每号一专属助手；�
 
 MCP `grok-wechat` → iLink。
 
+专属助手侧栏名 = 登记的 `assistant_name`（**单个随机英文单词**，如 `Cedar` / `Nimbus`；勿用「微信1」或用户中文名）；路由只认 `asst_id`。
+
 **主路径**：`私信 → typing → 合并 → gateway sendPrompt → 专属助手持久会话 → wechat_send → wechat_ack`  
 （保留专属助手侧栏上下文；不经安装助手推理。）
 
@@ -21,7 +23,8 @@ MCP `grok-wechat` → iLink。
 3. 登记安装助手作兜底：`wechat_set_wake(assistant_id=<Ori的agentId>, assistant_name="Ori")`  
    （url/key 参数已忽略。）
 4. `wechat_login_start` → `wechat_login_wait` 至 logged_in
-5. 每号：建专属助手 → `wechat_set_dedicated_assistant(ilink_bot_id, assistant_id, assistant_name)`  
+5. 每号：建专属助手时 **`assistant_name` 用单个随机英文单词**（如 `Cedar` / `Nimbus`；**不要**「微信1」、平台中文用户名或微信昵称）→ `wechat_set_dedicated_assistant(ilink_bot_id, assistant_id, assistant_name)`  
+   handoff **只认** `assistant_id`；仅改名且 id 不变不重置 hist 同步。  
    `wechat_status` 显示 `wake: "handoff"` 与 `fallback: { id, name, via: "sendPrompt" }`；`monitor_stale: false`。
 
 ### 安装助手（Ori）收到兜底 payload 时
@@ -33,7 +36,7 @@ payload 可能带 `warn`（如 `fallback:handoff_failed` / `fallback:assistant_u
 
 入站 JSON 出现在专属助手会话里。按 payload：`event` 按 hint 告知用户；否则 `wechat_send(to_user_id=from, ilink_bot_id=bot)` 后 `wechat_ack(ids)`。不要转交其他助手，不要把内容镜像到 App 聊天。
 
-## 「微信1不回」如何判定（无 webhook）
+## 专属助手不回如何判定（无 webhook）
 
 插件在成功 `sendPrompt` handoff 后监视收件箱：若消息仍未 ack 且期间无 `wechat_send`（`ASSISTANT_STALE_MS`≈2min 算一次 strike；连续 3 次或单次 ≥5min）→ `demoteAssistant` 清掉专属登记，并把未回复消息 **sendPrompt 给 Ori**。不经过外部 webhook。
 

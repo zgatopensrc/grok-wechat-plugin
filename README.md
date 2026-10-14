@@ -24,7 +24,7 @@ Grok Bot 的微信 iLink 渠道。扫码绑定个人号后，私信由插件经�
 
 1. 确认添加渠道  
 2. 加连接器；**不要**建「微信监听保活」或「微信入站唤醒」。`wechat_set_wake(assistant_id, assistant_name)` 登记 Ori 兜底  
-3. 扫码；每号专属助手 + `wechat_set_dedicated_assistant`  
+3. 扫码；每号建专属助手（**单个随机英文单词**，勿用「微信1」/中文用户名）+ `wechat_set_dedicated_assistant`（路由认 `asst_id`）  
 4. `wechat_status`：`wake: "handoff"`、`monitor_stale: false`
 
 ## 卸载

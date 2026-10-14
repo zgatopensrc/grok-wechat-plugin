@@ -315,13 +315,13 @@ const tools = {
       ok(await setAccountWake(ilink_bot_id, url, key, assistant_id, assistant_name)),
   },
   wechat_set_dedicated_assistant: {
-    description: "Register dedicated assistant. Re-register resets hist sync.",
+    description: "Register dedicated assistant (assistant_name = short random English sidebar name). Same asst_id rename keeps hist; new/swapped id resets hist sync.",
     inputSchema: {
       type: "object",
       properties: {
         ilink_bot_id: { type: "string" },
         assistant_id: { type: "string" },
-        assistant_name: { type: "string" },
+        assistant_name: { type: "string", description: "Sidebar display name: short random English (e.g. Cedar Finch). Handoff uses assistant_id only." },
       },
       required: ["ilink_bot_id", "assistant_name"],
     },
@@ -402,7 +402,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.11.7" },
+        serverInfo: { name: "grok-wechat", version: "1.11.9" },
       },
     };
   }
