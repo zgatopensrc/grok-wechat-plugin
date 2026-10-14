@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "grok-wechat",
-  "description": "微信 iLink 渠道：扫码、收发、媒体、自动正在输入、每号专属助手+精简上下文。",
-  "version": "1.11.3",
+  "description": "微信 iLink 渠道：扫码、收发、媒体、自动正在输入、每号专属助手；入站 sendPrompt handoff；Ori sendPrompt 兜底；无外部 webhook；监听自愈。",
+  "version": "1.11.7",
   "author": {
     "name": "little-thing"
   }

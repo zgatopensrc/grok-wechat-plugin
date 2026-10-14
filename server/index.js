@@ -12,8 +12,8 @@ import {
   clearPid,
   findAccount,
   getAccountAssistant,
+  getHandoffFrom,
   getTalkCount,
-  hasGlobalWake,
   inboxByIds,
   isAllowed,
   lastAssistantAt,
@@ -28,12 +28,16 @@ import {
   clearHeartbeat,
   monitorHeartbeatStale,
   readHeartbeat,
+  listMonitorPids,
+  readPid,
+  stopMonitorPids,
+  withMonitorLock,
+  isPidAlive,
   packMsgs,
   noteBlocked,
   paths,
   peekInbox,
   removeAccount,
-  resolveWakeForAccount,
   slim,
   talkKey,
   updateState,
@@ -55,6 +59,7 @@ import {
   setTyping,
   statusPayload,
 } from "./ilink.js";
+import { handoffWakeToAssistant, gatewayAvailable } from "./handoff.js";
 import { registerShutdownCleanup, touchConnectorActive, connectorAbandoned, runUninstall, uninstallWechat } from "./uninstall.js";
 
 const self = fileURLToPath(import.meta.url);
@@ -89,36 +94,64 @@ async function sleep(ms) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
-const HEARTBEAT_STALE_MS = 90_000; // > 2 long-poll cycles with no successful getupdates
+const HEARTBEAT_STALE_MS = 90_000; // > ~2 long-poll cycles with no getupdates return
+const MCP_WATCHDOG_MS = 30_000; // MCP host re-checks monitor; replaces Ori cron keepalive
 
 function ensureMonitor() {
-  const existing = monitorRunning();
-  if (existing) {
-    // Pid alone is not enough: a hung long-poll leaves the process alive but deaf.
-    if (!monitorHeartbeatStale(HEARTBEAT_STALE_MS)) {
-      return { already_running: true, pid: existing, healthy: true };
+  return withMonitorLock(() => {
+    const accounts = listAccounts();
+    const live = listMonitorPids().filter((p) => p !== process.pid);
+    const filePid = monitorRunning();
+
+    if (!accounts.length) {
+      const reaped = live.length ? stopMonitorPids(live) : [];
+      clearPid();
+      clearHeartbeat();
+      return { started: false, reason: "not_logged_in", reaped_orphans: reaped };
     }
-    try { process.kill(existing, "SIGTERM"); } catch { /* gone */ }
-    clearPid();
-    clearHeartbeat();
-    // Fall through and start a fresh monitor.
-  }
-  const accounts = listAccounts();
-  if (!accounts.length) return { started: false, reason: "not_logged_in" };
-  const child = spawn(process.execPath, [self, "--monitor"], {
-    detached: true,
-    stdio: "ignore",
-    env: process.env,
+
+    // Reap orphans that are not the pid-file owner (dual-monitor races).
+    const orphans = live.filter((p) => p !== filePid);
+    if (orphans.length) stopMonitorPids(orphans, { waitMs: 800, clearFiles: false });
+
+    const existing = monitorRunning();
+    if (existing && !monitorHeartbeatStale(HEARTBEAT_STALE_MS)) {
+      const extras = listMonitorPids().filter((p) => p !== existing && p !== process.pid);
+      if (extras.length) stopMonitorPids(extras, { waitMs: 500, clearFiles: false });
+      writePid(existing);
+      return {
+        already_running: true,
+        pid: existing,
+        healthy: true,
+        reaped_orphans: orphans.concat(extras),
+      };
+    }
+
+    // Dead, missing, or heartbeat-stale → tear down everything and spawn one.
+    const toStop = listMonitorPids().filter((p) => p !== process.pid);
+    const restarted_stale = Boolean(existing) || monitorHeartbeatStale(HEARTBEAT_STALE_MS);
+    if (toStop.length) stopMonitorPids(toStop);
+    else {
+      clearPid();
+      clearHeartbeat();
+    }
+
+    const child = spawn(process.execPath, [self, "--monitor"], {
+      detached: true,
+      stdio: "ignore",
+      env: process.env,
+    });
+    child.unref();
+    writePid(child.pid);
+    writeHeartbeat({ pid: child.pid, boot: true });
+    return {
+      started: true,
+      pid: child.pid,
+      account_count: accounts.length,
+      restarted_stale,
+      reaped_orphans: orphans.concat(toStop.filter((p) => p !== existing)),
+    };
   });
-  child.unref();
-  writePid(child.pid);
-  writeHeartbeat({ pid: child.pid, boot: true });
-  return {
-    started: true,
-    pid: child.pid,
-    account_count: accounts.length,
-    restarted_stale: Boolean(existing),
-  };
 }
 
 const accountRefSchema = {
@@ -267,17 +300,19 @@ const tools = {
     handle: async () => ok(ensureMonitor()),
   },
   wechat_set_wake: {
-    description: "Save wake url+key. With ilink_bot_id=own (direct); without=global fallback.",
+    description: "Register Ori/installing assistant as sendPrompt fallback (assistant_id+assistant_name). External Cursor webhook url/key removed in 1.11.6 and are ignored. Primary wake remains dedicated handoff.",
     inputSchema: {
       type: "object",
       properties: {
-        url: { type: "string" },
-        key: { type: "string" },
-        ilink_bot_id: { type: "string" },
+        assistant_id: { type: "string", description: "installing assistant / Ori agent id for sendPrompt fallback" },
+        assistant_name: { type: "string", description: "e.g. Ori" },
+        url: { type: "string", description: "deprecated; ignored" },
+        key: { type: "string", description: "deprecated; ignored" },
+        ilink_bot_id: { type: "string", description: "optional; clears leftover account.wake if set" },
       },
-      required: ["url", "key"],
     },
-    handle: async ({ ilink_bot_id, url, key }) => ok(await setAccountWake(ilink_bot_id, url, key)),
+    handle: async ({ ilink_bot_id, url, key, assistant_id, assistant_name }) =>
+      ok(await setAccountWake(ilink_bot_id, url, key, assistant_id, assistant_name)),
   },
   wechat_set_dedicated_assistant: {
     description: "Register dedicated assistant. Re-register resets hist sync.",
@@ -294,14 +329,17 @@ const tools = {
       ok(setDedicatedAssistant(ilink_bot_id, assistant_id, assistant_name)),
   },
   wechat_stop_monitor: {
-    description: "Stop monitor.",
+    description: "Stop monitor (all --monitor processes).",
     inputSchema: { type: "object", properties: {} },
     handle: async () => {
-      const pid = monitorRunning();
-      if (!pid) return ok({ stopped: true, was_running: false });
-      try { process.kill(pid, "SIGTERM"); } catch { /* ignore */ }
-      clearPid();
-      return ok({ stopped: true, pid });
+      const pids = listMonitorPids();
+      if (!pids.length) {
+        clearPid();
+        clearHeartbeat();
+        return ok({ stopped: true, was_running: false });
+      }
+      stopMonitorPids(pids);
+      return ok({ stopped: true, pids });
     },
   },
   wechat_approve: {
@@ -364,7 +402,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.11.3" },
+        serverInfo: { name: "grok-wechat", version: "1.11.7" },
       },
     };
   }
@@ -386,6 +424,11 @@ async function onRpc(msg) {
 function startMcp() {
   registerShutdownCleanup();
   ensureMonitor();
+  // Self-heal without Ori「微信监听保活」: while the connector MCP host is up,
+  // periodically restart a dead/stale/orphan monitor.
+  setInterval(() => {
+    try { ensureMonitor(); } catch { /* ignore */ }
+  }, MCP_WATCHDOG_MS).unref?.();
   let buf = Buffer.alloc(0);
   process.stdin.on("data", async (chunk) => {
     buf = Buffer.concat([buf, chunk]);
@@ -451,9 +494,7 @@ function readMs(raw, dflt) {
 
 const COALESCE_MS = readMs(process.env.GROK_WECHAT_COALESCE_MS, DEFAULT_COALESCE_MS);
 const COALESCE_IDLE_MS = Math.min(readMs(process.env.GROK_WECHAT_COALESCE_IDLE_MS, DEFAULT_COALESCE_IDLE_MS), COALESCE_MS);
-const WAKE_TIMEOUT_MS = 12_000;
-const WAKE_ATTEMPT_DELAYS_MS = [0, 800, 2_500];
-// Background retries (after the quick attempts failed): sooner at first, then every 30s.
+// Background retries for failed sendPrompt handoff: sooner at first, then every 30s.
 const WAKE_RETRY_INTERVALS_MS = [10_000, 20_000, 30_000];
 const WAKE_RETRY_MAX = 6;
 const TYPING_KEEPALIVE_MS = 5_000;
@@ -523,80 +564,104 @@ function typingTick(log) {
   }
 }
 
-// --- wake ---------------------------------------------------------------------
-async function postOnce(cfg, body) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), WAKE_TIMEOUT_MS);
-  try {
-    const res = await fetch(cfg.url, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${cfg.key}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    const text = await res.text();
-    return { ok: res.ok, status: res.status, text };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/** POST with a couple of quick retries. Client errors (4xx except 429) are not retried. */
-async function postWake(cfg, body, botId, log) {
-  for (const delay of WAKE_ATTEMPT_DELAYS_MS) {
-    if (delay) await sleep(delay);
-    try {
-      const t0 = Date.now();
-      const r = await postOnce(cfg, body);
-      log(`wake bot=${botId} n=${body.n ?? body.event} ${r.status} ${Date.now() - t0}ms ${r.text.slice(0, 100)}`);
-      if (r.ok) return true;
-      if (r.status >= 400 && r.status < 500 && r.status !== 429) return false;
-    } catch (err) {
-      log(`wake error bot=${botId} ${errText(err)}`);
-    }
-  }
-  return false;
-}
-
+// --- wake (local gateway sendPrompt only; no external Cursor webhook) ---------
 const failedWakes = []; // { botId, ids, tries, next }
 
-async function wakeBot(botId, batch, log) {
-  const state = loadState();
+function buildWakeBody(botId, batch, state, extraWarn) {
   const account = findAccount(state, { ilink_bot_id: botId });
-  const cfg = resolveWakeForAccount(account);
-  if (!cfg) {
-    log(`wake skipped bot=${botId}: no wake config`);
-    return null; // nothing to retry or watch
-  }
   const dedicated = getAccountAssistant(state, botId);
   const packed = packMsgs(batch, state);
-  // Compact wake: no src/n; msgs drop redundant bot/asst (top-level has them).
   if (packed.msgs) {
     packed.msgs = packed.msgs.map((m) => {
       const { bot: _b, asst: _a, ...rest } = m;
       return rest;
     });
   }
-  const body = {
+  const warns = [];
+  if (account?.lostAssistant) warns.push(`assistant_missing:${account.lostAssistant.name || account.lostAssistant.id}`);
+  if (extraWarn) warns.push(extraWarn);
+  return slim({
     bot: botId,
     asst: dedicated?.name || "",
     asst_id: dedicated?.id || "",
     ...packed,
-    warn: account?.lostAssistant
-      ? `assistant_missing:${account.lostAssistant.name || account.lostAssistant.id}`
-      : undefined,
+    warn: warns.length ? warns.join(";") : undefined,
     ack: "wechat_ack",
-  };
-  return postWake(cfg, slim(body), botId, log);
+  });
 }
 
-/** Non-message wake (e.g. login expired) so the agent can tell the user. */
+/** sendPrompt → Ori / installing assistant (persistent chat). */
+async function handoffToFallback(body, mid, log, reason) {
+  const fb = getHandoffFrom();
+  if (!fb?.id) {
+    log(`fallback skipped: no handoffFrom (register Ori via wechat_set_wake assistant_id=...) reason=${reason || ""}`);
+    return null;
+  }
+  if (!gatewayAvailable()) {
+    log(`fallback skipped: gateway unavailable reason=${reason || ""}`);
+    return false;
+  }
+  const payload = slim({ ...body, warn: [body.warn, `fallback:${reason || "ori"}`].filter(Boolean).join(";") || undefined });
+  log(`wake mode=fallback bot=${body.bot || ""} asst=${fb.name || fb.id} via=sendPrompt reason=${reason || ""}`);
+  return handoffWakeToAssistant(fb, payload, mid ? `${mid}:fb` : undefined, log);
+}
+
+async function wakeBot(botId, batch, log, opts = {}) {
+  const state = loadState();
+  const dedicated = getAccountAssistant(state, botId);
+  const forceFallback = Boolean(opts.forceFallback);
+  const reason = opts.reason || "";
+  const body = buildWakeBody(botId, batch, state, forceFallback ? reason : undefined);
+  const msgIds = (batch || []).map((m) => m.id).filter(Boolean);
+  const mid = `wechat-wake:${botId}:${msgIds.join(",") || Date.now()}`;
+
+  // Primary: dedicated assistant persistent session (same path as SendToAgent).
+  if (!forceFallback && dedicated?.id && gatewayAvailable()) {
+    log(`wake mode=handoff bot=${botId} asst=${dedicated.name || dedicated.id}`);
+    const ok = await handoffWakeToAssistant(dedicated, body, mid, log);
+    if (ok) return true;
+    log(`handoff failed; falling back to Ori sendPrompt bot=${botId}`);
+    return handoffToFallback(body, mid, log, reason || "handoff_failed");
+  }
+
+  if (!forceFallback && dedicated?.id && !gatewayAvailable()) {
+    log(`handoff unavailable (no gateway); trying Ori fallback bot=${botId}`);
+  } else if (!forceFallback && !dedicated?.id) {
+    log(`no dedicated asst; trying Ori fallback bot=${botId}`);
+  }
+
+  return handoffToFallback(body, mid, log, reason || (dedicated?.id ? "gateway_unavailable" : "no_dedicated"));
+}
+
+/** Non-message wake (e.g. login expired): sendPrompt to dedicated if any, else Ori. */
 async function wakeEvent(botId, event, extra, log) {
   const state = loadState();
-  const cfg = resolveWakeForAccount(findAccount(state, { ilink_bot_id: botId }));
-  if (!cfg) return null;
   const dedicated = getAccountAssistant(state, botId);
-  return postWake(cfg, slim({ src: "grok-wechat", event, bot: botId, asst: dedicated?.name || "", asst_id: dedicated?.id || "", ...extra }), botId, log);
+  const fb = getHandoffFrom(state);
+  const body = slim({
+    src: "grok-wechat",
+    event,
+    bot: botId,
+    asst: dedicated?.name || "",
+    asst_id: dedicated?.id || "",
+    ...extra,
+  });
+  const mid = `wechat-event:${botId}:${event}:${Date.now()}`;
+  if (!gatewayAvailable()) {
+    log(`event ${event} bot=${botId}: gateway unavailable (logged only)`);
+    return null;
+  }
+  if (dedicated?.id) {
+    log(`event ${event} mode=handoff bot=${botId} asst=${dedicated.name || dedicated.id}`);
+    const ok = await handoffWakeToAssistant(dedicated, body, mid, log);
+    if (ok) return true;
+    log(`event handoff failed; Ori fallback event=${event} bot=${botId}`);
+  }
+  if (!fb?.id) {
+    log(`event ${event} bot=${botId}: no handoff target (logged only)`);
+    return null;
+  }
+  return handoffToFallback(body, mid, log, `event:${event}`);
 }
 
 async function wakeAgent(messages, log) {
@@ -630,11 +695,11 @@ async function retryFailedWakes(log) {
     if (!still.length || f.tries >= WAKE_RETRY_MAX) {
       failedWakes.splice(i, 1);
       if (still.length) {
-        // Its own webhook never accepts wakes (e.g. the assistant/Routine was deleted): treat the assistant as gone.
-        const account = findAccount(loadState(), { ilink_bot_id: f.botId });
-        if (account?.wake?.url && getAccountAssistant(loadState(), f.botId)) {
-          log(`WARN own webhook failed ${WAKE_RETRY_MAX}x bot=${f.botId}`);
-          await demoteAssistant(f.botId, log);
+        log(`WARN sendPrompt wake failed ${WAKE_RETRY_MAX}x bot=${f.botId}; messages remain in inbox (no external webhook)`);
+        // If dedicated still registered but never accepted handoff, try one forced Ori fallback.
+        if (getAccountAssistant(loadState(), f.botId) && getHandoffFrom()) {
+          const ok = await wakeBot(f.botId, still, log, { forceFallback: true, reason: "handoff_retry_exhausted" });
+          if (ok === true) watches.push({ botId: f.botId, ids: still.map((m) => m.id).filter(Boolean), at: Date.now(), struck: false });
         }
       }
       continue;
@@ -661,11 +726,17 @@ async function demoteAssistant(botId, log) {
   strikes.delete(botId);
   for (let i = watches.length - 1; i >= 0; i--) if (watches[i].botId === botId) watches.splice(i, 1);
   if (!lost) return;
-  // Its own webhook belonged to that assistant; fall back to the global one if there is one.
-  if (hasGlobalWake() && clearAccountWake(botId)) log(`own webhook cleared bot=${botId}: falling back to the global webhook`);
-  log(`ALERT dedicated assistant "${lost.name || lost.id}" is not replying bot=${botId}: registration cleared, next wakes carry full history. Recreate it and run wechat_set_dedicated_assistant`);
+  // Drop leftover legacy account.wake fields (external webhook removed).
+  if (clearAccountWake(botId)) log(`cleared leftover account.wake bot=${botId}`);
+  log(`ALERT dedicated assistant "${lost.name || lost.id}" is not replying bot=${botId}: registration cleared. Unanswered msgs → Ori sendPrompt fallback (no external webhook). Recreate dedicated with wechat_set_dedicated_assistant`);
   const rows = listInboxRaw().filter((m) => m.ilink_bot_id === botId && isUnanswered(m));
-  if (rows.length) await wakeAndTrack(botId, rows, log);
+  // Force Ori fallback: dedicated was just cleared / unresponsive.
+  if (rows.length) {
+    const ok = await wakeBot(botId, rows, log, { forceFallback: true, reason: "assistant_unresponsive" });
+    const ids = rows.map((m) => m.id).filter(Boolean);
+    if (ok === false) failedWakes.push({ botId, ids, tries: 0, next: Date.now() + WAKE_RETRY_INTERVALS_MS[0] });
+    else if (ok === true && ids.length) watches.push({ botId, ids, at: Date.now(), struck: false });
+  }
 }
 
 async function checkAssistantHealth(log) {
@@ -863,6 +934,9 @@ async function accountLoop(token, ctl, log) {
       if (r.messages.length) enqueue(account.ilinkBotId, r.messages, log);
     } catch (err) {
       failures += 1;
+      // Still breathing: avoid stale-kill restart storms during transient network errors.
+      // Hung polls that never return still go stale (no heartbeat) and get restarted.
+      writeHeartbeat({ bot: account.ilinkBotId, ok: false, failures });
       log(`getupdates error bot=${account.ilinkBotId} ${errText(err)} failures=${failures}`);
       // After a few hard failures, re-bind the session so idle reconnects recover faster.
       if (failures === 3 || failures % 10 === 0) {
@@ -880,17 +954,27 @@ async function runMonitor() {
   const log = (line) => {
     logStream.write(`${new Date().toISOString()} ${line}\n`);
   };
-  log("monitor start");
+  // Singleton: if another healthy monitor already owns the pid file, exit (orphan).
+  const owner = monitorRunning();
+  if (owner && owner !== process.pid && !monitorHeartbeatStale(HEARTBEAT_STALE_MS)) {
+    log(`monitor duplicate exit pid=${process.pid} owner=${owner}`);
+    process.exit(0);
+  }
+  writePid(process.pid);
+  writeHeartbeat({ pid: process.pid, boot: true });
+  log(`monitor start pid=${process.pid}`);
   for (const key of loadSeenKeys(SEEN_MAX)) seenIds.add(key);
   const onExit = async () => {
     await Promise.all(listAccounts().map((a) => notifyStop(a)));
-    clearPid();
-    clearHeartbeat();
+    if (readPid() === process.pid || !isPidAlive(readPid())) {
+      clearPid();
+      clearHeartbeat();
+    }
     process.exit(0);
   };
   process.on("SIGTERM", onExit);
   process.on("SIGINT", onExit);
-  // A stray error must not kill polling: the next keepalive can be up to 20 minutes away.
+  // A stray error must not kill polling; MCP watchdog (~30s) + heartbeat stale (~90s) restart us.
   process.on("uncaughtException", (err) => log(`uncaught ${errText(err)}`));
   process.on("unhandledRejection", (err) => log(`unhandled rejection ${errText(err)}`));
 

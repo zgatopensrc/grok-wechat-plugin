@@ -6,8 +6,8 @@ import {
   contextFor,
   emptyAccount,
   findAccount,
-  hasGlobalWake,
-  resolveWakeForAccount,
+  getHandoffFrom,
+  hasAccountWake,
   listAccounts,
   loadState,
   localTokenList,
@@ -16,12 +16,13 @@ import {
   rememberContext,
   requireAccount,
   resolveAccountForPeer,
-  saveGlobalWake,
+  setHandoffFrom,
   listBlocked,
   resetSeeded,
   saveStateSecure,
   updateState,
   upsertAccount,
+  clearAccountWake,
 } from "./store.js";
 
 const CHANNEL_VERSION = "1.0.0";
@@ -558,14 +559,21 @@ export async function setTyping(toUserId, on, ilinkBotId) {
 export function statusPayload() {
   const state = loadState();
   const accounts = listAccounts(state);
+  const fallback = getHandoffFrom(state);
   return {
     logged_in: accounts.length > 0,
     n: accounts.length,
-    wake: accounts.length > 0 && accounts.every((a) => resolveWakeForAccount(a)), // every account has a webhook
+    // Ready if every account can be woken (dedicated handoff and/or Ori sendPrompt fallback).
+    wake: accounts.length > 0 && accounts.every((a) => hasAccountWake(a, state)),
+    fallback: fallback
+      ? { id: fallback.id, name: fallback.name, via: "sendPrompt" }
+      : undefined,
     accounts: accounts.map((a) => ({
       bot: a.ilinkBotId,
-      wake: a.wake?.url ? "own" : hasGlobalWake() ? "global" : undefined, // own = straight to its assistant
+      // handoff = sendPrompt → dedicated; fallback = sendPrompt → Ori only; none = cannot wake
+      wake: a.dedicatedAssistant?.id ? "handoff" : fallback?.id ? "fallback" : "none",
       asst: a.dedicatedAssistant?.name || "",
+      asst_id: a.dedicatedAssistant?.id || undefined,
       asst_lost: a.lostAssistant?.name || a.lostAssistant?.id || undefined, // stopped replying; re-register
       expired: a.expiredAt ? true : undefined, // login expired: re-scan with wechat_login_start
       peers: Object.keys(a.contextTokens || {}).length,
@@ -575,39 +583,43 @@ export function statusPayload() {
   };
 }
 
-export async function probeWake(url, key) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5_000);
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ src: "grok-wechat", probe: true }),
-      signal: controller.signal,
-    });
-    const text = await res.text();
-    return { status: res.status, body: text.slice(0, 80) };
-  } finally {
-    clearTimeout(timer);
+/**
+ * External Cursor webhook wake removed (1.11.6).
+ * Prefer setFallbackAssistant(assistant_id, name) to register Ori for sendPrompt fallback.
+ * Legacy url/key args are ignored (no POST).
+ */
+export async function setAccountWake(ilink_bot_id, url, key, assistant_id, assistant_name) {
+  // New path: register installing assistant (Ori) as sendPrompt fallback.
+  if (assistant_id) {
+    const fb = setHandoffFrom(assistant_id, assistant_name || "Ori");
+    // Drop leftover per-account own-webhook fields if any.
+    if (ilink_bot_id) clearAccountWake(ilink_bot_id);
+    return {
+      wake: true,
+      mode: "fallback_sendPrompt",
+      fallback: fb,
+      note: "External webhook removed. Fallback is local gateway sendPrompt → this assistant.",
+      ignored_url: Boolean(url),
+      ignored_key: Boolean(key),
+    };
   }
+  return {
+    wake: false,
+    deprecated: true,
+    mode: "none",
+    note: "External Cursor webhook wake removed in 1.11.6. Pass assistant_id (+ optional assistant_name) to register Ori/installing assistant as sendPrompt fallback; primary path remains wechat_set_dedicated_assistant → handoff.",
+  };
 }
 
-export async function setAccountWake(ilink_bot_id, url, key) {
-  if (!url || !key) throw new Error("url 和 key 必填");
-  const probe = await probeWake(url, key);
-  saveGlobalWake(url, key);
-  if (ilink_bot_id) {
-    updateState((s) => {
-      const hit = findAccount(s, { ilink_bot_id });
-      if (hit) hit.wake = { url, key };
-      return s;
-    });
-  }
-  saveStateSecure(loadState());
-  return { wake: true, probe };
+/** Register installing assistant (Ori) for sendPrompt fallback when dedicated handoff fails. */
+export function setFallbackAssistant(assistant_id, assistant_name) {
+  const fb = setHandoffFrom(assistant_id, assistant_name || "Ori");
+  return {
+    wake: true,
+    mode: "fallback_sendPrompt",
+    fallback: fb,
+    next: "inbound: sendPrompt → dedicated asst first; on fail/no asst/demote → sendPrompt → this assistant",
+  };
 }
 
 export function setDedicatedAssistant(ilink_bot_id, assistant_id, assistant_name) {
@@ -624,5 +636,17 @@ export function setDedicatedAssistant(ilink_bot_id, assistant_id, assistant_name
   });
   saveStateSecure(loadState());
   resetSeeded(ilink_bot_id); // (re)registering = fresh thread assumed: resend full history once
-  return { bot: ilink_bot_id, asst: assistant_name, asst_id: assistant_id || "" };
+  const account = findAccount(loadState(), { ilink_bot_id });
+  const hasId = Boolean(assistant_id || account?.dedicatedAssistant?.id);
+  const fb = getHandoffFrom();
+  return {
+    bot: ilink_bot_id,
+    asst: assistant_name,
+    asst_id: assistant_id || account?.dedicatedAssistant?.id || "",
+    wake: hasId ? "handoff" : fb?.id ? "fallback" : "none",
+    fallback: fb ? { id: fb.id, name: fb.name } : undefined,
+    next: hasId
+      ? "inbound: gateway sendPrompt → this assistant persistent session; Ori only if handoff fails or assistant stops replying"
+      : "pass assistant_id for primary handoff; ensure Ori registered via wechat_set_wake(assistant_id=...) for fallback",
+  };
 }
