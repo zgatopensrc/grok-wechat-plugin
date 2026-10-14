@@ -101,6 +101,15 @@ const MCP_WATCHDOG_MS = 30_000; // MCP host re-checks monitor; replaces Ori cron
 const POLL_HARD_TIMEOUT_MS = 50_000;
 const SELF_HEAL_MS = 15_000; // monitor checks its own heartbeat; does not need MCP host
 
+/** Append to monitor.log from the MCP host (no --monitor log stream). */
+function mcpWatchLog(line) {
+  try {
+    fs.appendFileSync(paths().log, `${new Date().toISOString()} mcp-watchdog pid=${process.pid} ${line}\n`);
+  } catch {
+    // ignore disk errors; never block tool RPC
+  }
+}
+
 function ensureMonitor() {
   return withMonitorLock(() => {
     const accounts = listAccounts();
@@ -406,7 +415,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.11.11" },
+        serverInfo: { name: "grok-wechat", version: "1.11.12" },
       },
     };
   }
@@ -425,13 +434,43 @@ async function onRpc(msg) {
   return { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } };
 }
 
+function runMcpWatchdogTick(reason) {
+  const hb = readHeartbeat();
+  const age = hb?.at ? Date.now() - Number(hb.at) : null;
+  const filePid = readPid();
+  try {
+    const r = ensureMonitor();
+    const stale = age == null || age > HEARTBEAT_STALE_MS;
+    // Always one line per tick so we can prove the host timer is alive.
+    mcpWatchLog(
+      `tick reason=${reason}`
+      + ` filePid=${filePid || 0}`
+      + ` hbAgeMs=${age == null ? "none" : age}`
+      + ` stale=${stale}`
+      + ` result=${JSON.stringify(r)}`,
+    );
+    return r;
+  } catch (err) {
+    mcpWatchLog(`ERROR reason=${reason} ${errText(err)}`);
+    throw err;
+  }
+}
+
 function startMcp() {
   registerShutdownCleanup();
-  ensureMonitor();
+  try {
+    runMcpWatchdogTick("boot");
+  } catch {
+    /* ignore boot ensure errors */
+  }
   // Self-heal without Ori「微信监听保活」: while the connector MCP host is up,
   // periodically restart a dead/stale/orphan monitor.
   setInterval(() => {
-    try { ensureMonitor(); } catch { /* ignore */ }
+    try {
+      runMcpWatchdogTick("interval");
+    } catch {
+      /* already logged */
+    }
   }, MCP_WATCHDOG_MS).unref?.();
   let buf = Buffer.alloc(0);
   process.stdin.on("data", async (chunk) => {
@@ -942,14 +981,19 @@ async function accountLoop(token, ctl, log) {
     const account = findAccount(loadState(), { token });
     if (!account?.token) break;
     try {
+      let hardTimer;
       const r = await Promise.race([
         pollAccount(account, log),
-        sleep(POLL_HARD_TIMEOUT_MS).then(() => {
-          const err = new Error(`poll hard timeout ${POLL_HARD_TIMEOUT_MS}ms`);
-          err.name = "PollHardTimeout";
-          throw err;
+        new Promise((_, reject) => {
+          hardTimer = setTimeout(() => {
+            const err = new Error(`poll hard timeout ${POLL_HARD_TIMEOUT_MS}ms`);
+            err.name = "PollHardTimeout";
+            reject(err);
+          }, POLL_HARD_TIMEOUT_MS);
         }),
-      ]);
+      ]).finally(() => {
+        if (hardTimer) clearTimeout(hardTimer);
+      });
       failures = 0;
       writeHeartbeat({ bot: account.ilinkBotId, ok: true });
       if (r.expired) {
@@ -1052,7 +1096,10 @@ async function runMonitor() {
   // ticking), respawn ourselves. MCP host watchdog remains a backup when hosts are up.
   setInterval(() => {
     try {
+      const hb = readHeartbeat();
+      const age = hb?.at ? Date.now() - Number(hb.at) : null;
       if (readPid() === process.pid && monitorHeartbeatStale(HEARTBEAT_STALE_MS)) {
+        log(`self-heal: heartbeat stale ageMs=${age == null ? "none" : age} threshold=${HEARTBEAT_STALE_MS}`);
         respawnMonitor(log, `own heartbeat stale >${HEARTBEAT_STALE_MS}ms`);
       }
     } catch (err) {
