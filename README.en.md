@@ -17,7 +17,7 @@ WeChat iLink channel for Grok Bot. After QR bind, DMs wake the matching **dedica
 - **Reliable delivery**: `wechat_inbox` only peeks, `wechat_ack` removes after a successful reply; inbox writes are cross-process locked; failed wakes are retried; inbound is deduped by `message_id`
 - **Allowlist (default-deny)**: only the account owner (the WeChat user who scanned) and listed users are handled; strangers are dropped and shown in `wechat_status.blocked`, then allowed with `wechat_approve`
 - **Self-healing**: a dead/unresponsive dedicated assistant (3 consecutive wakes unanswered for 2 min, or 5 min with no reply) is cleared automatically, full history is resent and the payload carries `warn`; after a monitor restart unanswered wakes are re-sent; handled message ids are persisted for dedupe; an expired WeChat login wakes the agent (`event: login_expired`) so you get asked to re-scan
-- **Global webhook with forwarding (default)**: paste once; it covers every current and future bound account. The installing assistant wakes and forwards by `bot`→`asst` to that account's dedicated assistant. Optional: have a dedicated assistant create its own webhook and register it with `wechat_set_wake` plus `ilink_bot_id`, so that account skips the forwarding hop (see `skills/wechat-channel/SKILL.md`)
+- **Code handoff (recommended, low latency)**: after `wechat_set_dedicated_assistant` with `assistant_id`, the plugin calls local gateway `sendPrompt` into that assistant’s **persistent session** (same path as SendToAgent) — **no** installing-assistant LLM turn, and **do not** create an own webhook on the dedicated assistant (automation webhooks are fresh runs and drop sidebar context). Global webhook remains fallback (see `skills/wechat-channel/SKILL.md`)
 
 ## One-line install
 
@@ -43,7 +43,7 @@ Follow the conversation. The full flow looks like this:
    `wechat_login_start` shows a QR code, then immediately `wechat_login_wait` until `logged_in=true`. After each bind, **create a dedicated Grok Bot assistant** for that WeChat number and call `wechat_set_dedicated_assistant` with its id and name; dedicated assistants do not create inbound routines. Bind more accounts by repeating start and wait — no second webhook paste.
 
 4. **Binding complete**  
-   `wechat_status` shows each account's `wake: "global"` and dedicated assistant name. Inbound: the plugin POSTs the global webhook, waking the installing assistant with the message (and full history the first time); it forwards unchanged by `bot`→`asst` to that account's dedicated assistant, which replies in its own session.
+   `wechat_status` shows each account's `wake: "handoff"` (when `assistant_id` is set) and dedicated assistant name. Inbound: the plugin code-handoffs into the dedicated assistant’s persistent session; only on failure does it POST the global webhook for the installing assistant to forward.
 
 When someone DMs you on WeChat, the bot can reply there.
 
@@ -63,7 +63,7 @@ One connector binds multiple WeChat personal accounts. One global webhook covers
 
 ## Flow
 
-WeChat DM → monitor inbox (auto typing) → POST global webhook → installing assistant wakes (payload has msgs, full hist the first time) → forward by `bot`→`asst` to the dedicated assistant → `wechat_send` / `wechat_send_media` → `wechat_ack`
+WeChat DM → monitor inbox (auto typing) → POST **own** webhook (direct to dedicated assistant) or global webhook (installing assistant forwards by `bot`→`asst`) → `wechat_send` / `wechat_send_media` → `wechat_ack`
 
 After a task finishes, reply immediately.
 

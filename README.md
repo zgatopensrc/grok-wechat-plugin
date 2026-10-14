@@ -17,7 +17,7 @@ Grok Bot 的微信 iLink 渠道。扫码绑定个人号后，私信经共享 web
 - **可靠取件**：`wechat_inbox` 只 peek，成功回复后 `wechat_ack` 再删；入站写入带跨进程锁；webhook 失败自动重试；按 `message_id` 去重
 - **allowlist（默认拒绝）**：只处理绑定账号的主人（扫码的微信）和名单内的人；陌生人的消息被丢弃并记入 `wechat_status.blocked`，用 `wechat_approve` 放行
 - **故障自愈**：专属助手被删/不回复（连续 3 次唤醒 2 分钟无回复，或 5 分钟无回复）→ 自动清掉登记、改发完整历史并在 payload 带 `warn`；监听重启后自动补发未回复的唤醒；已处理消息编号落盘去重；微信登录过期会唤醒 agent（`event: login_expired`）提醒重新扫码
-- **全局 webhook 转交（默认）**：粘贴一次，覆盖当前及后续全部已绑定账号；安装助手被唤醒后按 `bot`→`asst` 转交该号专属助手。可选：让专属助手自己建 webhook 并 `wechat_set_wake` 带 `ilink_bot_id`，该号即直达、省掉转交（见 `skills/wechat-channel/SKILL.md`）
+- **代码 handoff（推荐，低延迟）**：登记专属助手 `assistant_id` 后，插件经本地 gateway `sendPrompt` 写入该助手**持久会话**（等同 SendToAgent），**不经**安装助手 LLM，也**不要**给专属助手建 own webhook（webhook 例程是全新跑、丢侧栏上下文）。全局 webhook 仅作兜底（见 `skills/wechat-channel/SKILL.md`）
 - **保活**：建议每 20 分钟 `wechat_start_monitor`（勿用 5 分钟）
 
 ## 一句话安装
@@ -44,7 +44,7 @@ Grok Bot 的微信 iLink 渠道。扫码绑定个人号后，私信经共享 web
    `wechat_login_start` 出码 → 立即 `wechat_login_wait` 至 `logged_in=true`。每次绑定成功后**创建该号的专属 Grok Bot 助手**，`wechat_set_dedicated_assistant` 登记 id/名称；专属助手不建入站 Routine。绑定更多账号时重复出码与等待，**无需**再粘贴 webhook。
 
 4. **绑定完成**  
-   `wechat_status` 显示各账号 `wake: "global"` 与专属助手名称。入站 POST 全局 webhook 唤醒安装助手，payload 已含消息（首次含完整历史），按 `bot`→`asst` 原样转交该号专属助手，由它在原会话里回复。
+   `wechat_status` 显示各账号 `wake: "handoff"`（已登记专属助手 id）与助手名称。入站由插件代码 handoff 到专属助手持久会话；失败时才 POST 全局 webhook 让安装助手转交。
 
 对方给你发一条微信私信，就能在微信里收到回复。
 
@@ -64,7 +64,7 @@ Grok Bot 的微信 iLink 渠道。扫码绑定个人号后，私信经共享 web
 
 ## 链路
 
-微信私信 → monitor 收件箱（自动「正在输入」）→ POST 全局 webhook → 安装助手醒来（payload 含 msgs，首次含完整 hist）→ 按 `bot`→`asst` 转交该号专属助手 → `wechat_send` / `wechat_send_media` → `wechat_ack`
+微信私信 → monitor 收件箱（自动「正在输入」）→ POST **own** webhook（有则直达专属助手）或全局 webhook（安装助手按 `bot`→`asst` 转交）→ `wechat_send` / `wechat_send_media` → `wechat_ack`
 
 任务做完立刻回复。`bot_agent` 为 `Grokbot/1.0.0`。
 

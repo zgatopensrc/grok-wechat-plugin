@@ -55,6 +55,7 @@ import {
   setTyping,
   statusPayload,
 } from "./ilink.js";
+import { handoffWakeToAssistant, gatewayAvailable } from "./handoff.js";
 import { registerShutdownCleanup, touchConnectorActive, connectorAbandoned, runUninstall, uninstallWechat } from "./uninstall.js";
 
 const self = fileURLToPath(import.meta.url);
@@ -267,7 +268,7 @@ const tools = {
     handle: async () => ok(ensureMonitor()),
   },
   wechat_set_wake: {
-    description: "Save wake url+key. With ilink_bot_id=own (direct); without=global fallback.",
+    description: "Save wake url+key. Prefer global (no ilink_bot_id)=fallback if gateway handoff fails. own webhook (ilink_bot_id) optional legacy; preferred path is code handoff to dedicated assistant persistent session.",
     inputSchema: {
       type: "object",
       properties: {
@@ -563,11 +564,6 @@ const failedWakes = []; // { botId, ids, tries, next }
 async function wakeBot(botId, batch, log) {
   const state = loadState();
   const account = findAccount(state, { ilink_bot_id: botId });
-  const cfg = resolveWakeForAccount(account);
-  if (!cfg) {
-    log(`wake skipped bot=${botId}: no wake config`);
-    return null; // nothing to retry or watch
-  }
   const dedicated = getAccountAssistant(state, botId);
   const packed = packMsgs(batch, state);
   // Compact wake: no src/n; msgs drop redundant bot/asst (top-level has them).
@@ -577,7 +573,7 @@ async function wakeBot(botId, batch, log) {
       return rest;
     });
   }
-  const body = {
+  const body = slim({
     bot: botId,
     asst: dedicated?.name || "",
     asst_id: dedicated?.id || "",
@@ -586,8 +582,27 @@ async function wakeBot(botId, batch, log) {
       ? `assistant_missing:${account.lostAssistant.name || account.lostAssistant.id}`
       : undefined,
     ack: "wechat_ack",
-  };
-  return postWake(cfg, slim(body), botId, log);
+  });
+  const msgIds = (batch || []).map((m) => m.id).filter(Boolean);
+  const mid = `wechat-wake:${botId}:${msgIds.join(",") || Date.now()}`;
+
+  // Preferred: local gateway sendPrompt (persistent session) → dedicated assistant persistent session
+  // (same path as SendToAgent). Skips Ori LLM forward; does NOT use own webhook (fresh run).
+  if (dedicated?.id && gatewayAvailable()) {
+    log(`wake mode=handoff bot=${botId} asst=${dedicated.name || dedicated.id}`);
+    const ok = await handoffWakeToAssistant(dedicated, body, mid, log);
+    if (ok) return true;
+    log(`handoff failed; falling back to webhook bot=${botId}`);
+  }
+
+  const cfg = resolveWakeForAccount(account);
+  if (!cfg) {
+    log(`wake skipped bot=${botId}: no wake config and handoff unavailable`);
+    return null; // nothing to retry or watch
+  }
+  const wakeMode = account?.wake?.url ? "own" : "global";
+  log(`wake mode=${wakeMode} bot=${botId} asst=${dedicated?.name || ""}`);
+  return postWake(cfg, body, botId, log);
 }
 
 /** Non-message wake (e.g. login expired) so the agent can tell the user. */

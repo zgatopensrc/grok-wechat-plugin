@@ -564,8 +564,16 @@ export function statusPayload() {
     wake: accounts.length > 0 && accounts.every((a) => resolveWakeForAccount(a)), // every account has a webhook
     accounts: accounts.map((a) => ({
       bot: a.ilinkBotId,
-      wake: a.wake?.url ? "own" : hasGlobalWake() ? "global" : undefined, // own = straight to its assistant
+      // handoff = code → dedicated persistent session; own = legacy webhook; global = Ori fallback
+      wake: a.dedicatedAssistant?.id
+        ? "handoff"
+        : a.wake?.url
+          ? "own"
+          : hasGlobalWake()
+            ? "global"
+            : undefined,
       asst: a.dedicatedAssistant?.name || "",
+      asst_id: a.dedicatedAssistant?.id || undefined,
       asst_lost: a.lostAssistant?.name || a.lostAssistant?.id || undefined, // stopped replying; re-register
       expired: a.expiredAt ? true : undefined, // login expired: re-scan with wechat_login_start
       peers: Object.keys(a.contextTokens || {}).length,
@@ -598,16 +606,25 @@ export async function probeWake(url, key) {
 export async function setAccountWake(ilink_bot_id, url, key) {
   if (!url || !key) throw new Error("url 和 key 必填");
   const probe = await probeWake(url, key);
-  saveGlobalWake(url, key);
+  // Without ilink_bot_id: write global fallback (installing assistant / Ori handoff).
+  // With ilink_bot_id: write that account's own webhook only (direct → dedicated assistant).
+  // Never clobber global when registering own — demotion falls back to global.
   if (ilink_bot_id) {
+    let found = false;
     updateState((s) => {
       const hit = findAccount(s, { ilink_bot_id });
-      if (hit) hit.wake = { url, key };
+      if (hit) {
+        hit.wake = { url, key };
+        found = true;
+      }
       return s;
     });
+    if (!found) throw new Error(`未找到账号 ${ilink_bot_id}，无法登记直达 webhook`);
+    saveStateSecure(loadState());
+    return { wake: true, mode: "own", bot: ilink_bot_id, probe };
   }
-  saveStateSecure(loadState());
-  return { wake: true, probe };
+  saveGlobalWake(url, key);
+  return { wake: true, mode: "global", probe };
 }
 
 export function setDedicatedAssistant(ilink_bot_id, assistant_id, assistant_name) {
@@ -624,5 +641,15 @@ export function setDedicatedAssistant(ilink_bot_id, assistant_id, assistant_name
   });
   saveStateSecure(loadState());
   resetSeeded(ilink_bot_id); // (re)registering = fresh thread assumed: resend full history once
-  return { bot: ilink_bot_id, asst: assistant_name, asst_id: assistant_id || "" };
+  const account = findAccount(loadState(), { ilink_bot_id });
+  const hasId = Boolean(assistant_id || account?.dedicatedAssistant?.id);
+  return {
+    bot: ilink_bot_id,
+    asst: assistant_name,
+    asst_id: assistant_id || account?.dedicatedAssistant?.id || "",
+    wake: hasId ? "handoff" : hasGlobalWake() ? "global" : "none",
+    next: hasId
+      ? "inbound uses gateway sendPrompt → this assistant persistent session (no Ori LLM; do not register own webhook)"
+      : "pass assistant_id so monitor can hand off without Ori LLM forward",
+  };
 }
