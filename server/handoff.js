@@ -7,9 +7,18 @@
  * on this host it appends without waking the live session; sendPrompt both persists
  * and starts a turn.
  */
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+/** Gateway sendPrompt rejects message_id / clientNonce over 256 chars. */
+function clampClientNonce(messageId) {
+  if (!messageId) return undefined;
+  const s = String(messageId);
+  if (s.length <= 256) return s;
+  return `wx:${crypto.createHash("sha256").update(s).digest("hex")}`;
+}
 
 const GATEWAY_JSON = path.join(os.homedir(), "agent-data", "gateway.json");
 const HANDOFF_TIMEOUT_MS = 8_000;
@@ -76,7 +85,7 @@ export async function handoffWakeToAssistant(dedicated, wakeBody, messageId, log
       agentId: dedicated.id,
       prompt: text,
       // Stable nonce for dedupe across wake retries when messageId is stable.
-      clientNonce: messageId || undefined,
+      clientNonce: clampClientNonce(messageId),
       initiator: "plugin_setup",
     });
     const ok = result?.accepted === true || result?.status === "accepted" || result?.ok === true;

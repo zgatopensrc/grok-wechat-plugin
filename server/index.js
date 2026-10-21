@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
@@ -415,7 +416,7 @@ async function onRpc(msg) {
       result: {
         protocolVersion: params?.protocolVersion || "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "grok-wechat", version: "1.11.14" },
+        serverInfo: { name: "grok-wechat", version: "1.11.15" },
       },
     };
   }
@@ -657,7 +658,12 @@ async function wakeBot(botId, batch, log, opts = {}) {
   const reason = opts.reason || "";
   const body = buildWakeBody(botId, batch, state, forceFallback ? reason : undefined);
   const msgIds = (batch || []).map((m) => m.id).filter(Boolean);
-  const mid = `wechat-wake:${botId}:${msgIds.join(",") || Date.now()}`;
+  const midRaw = `wechat-wake:${botId}:${msgIds.join(",") || Date.now()}`;
+  // sendPrompt clientNonce/message_id max 256; hash when coalesced ids blow the limit
+  const mid =
+    midRaw.length <= 240
+      ? midRaw
+      : `wechat-wake:${botId}:${crypto.createHash("sha256").update(midRaw).digest("hex").slice(0, 32)}`;
 
   // Primary: dedicated assistant persistent session (same path as SendToAgent).
   if (!forceFallback && dedicated?.id && gatewayAvailable()) {
